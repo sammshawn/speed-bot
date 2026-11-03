@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Speed Bot — Deriv</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚡</text></svg>" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <div class="orb orb-1"></div>
+  <div class="orb orb-2"></div>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-mark">⚡</span>
+        Speed Bot
+      </div>
+      <div class="auth-status" id="authStatus">
+        <span class="auth-dot" id="authDot"></span>
+        <span id="authText">Not logged in</span>
+      </div>
+    </div>
+  </header>
+
+  <main class="container">
+
+    <!-- LOGIN CARD (shown when not logged in) -->
+    <section class="login-card" id="loginCard">
+      <div class="login-icon">🔐</div>
+      <h1>Connect to Deriv</h1>
+      <p class="login-sub">Log in with your Deriv account to start the speed bot. Your token stays in your browser — it never touches our servers.</p>
+
+      <button class="btn-login" id="loginBtn">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
+          <polyline points="10 17 15 12 10 7"/>
+          <line x1="15" y1="12" x2="3" y2="12"/>
+        </svg>
+        Login to Deriv
+      </button>
+
+      <div class="login-note">
+        <strong>Demo account only.</strong> You'll be redirected to Deriv to authorise. No real funds are touched.
+      </div>
+    </section>
+
+    <!-- BOT DASHBOARD (shown when logged in) -->
+    <section class="bot-dashboard" id="botDashboard">
+      <div class="dashboard-header">
+        <div>
+          <h1>Speed Bot</h1>
+          <p class="dashboard-sub" id="accountInfo">Connected</p>
+        </div>
+        <button class="btn-logout" id="logoutBtn">Logout</button>
+      </div>
+
+      <div class="bot-grid">
+        <!-- CONFIG PANEL -->
+        <div class="panel config-panel">
+          <h2>Configuration</h2>
+
+          <label>Market
+            <select id="marketSelect">
+              <option value="R_10">V10</option>
+              <option value="R_25">V25</option>
+              <option value="R_50">V50</option>
+              <option value="R_75">V75</option>
+              <option value="R_100" selected>V100</option>
+              <option value="1HZ10V">V10 1s</option>
+              <option value="1HZ100V">V100 1s</option>
+            </select>
+          </label>
+
+          <label>Contract Type
+            <select id="contractType">
+              <option value="DIGITOVER">Over</option>
+              <option value="DIGITUNDER">Under</option>
+              <option value="DIGITEVEN">Even</option>
+              <option value="DIGITODD">Odd</option>
+            </select>
+          </label>
+
+          <label>Barrier (0–9)
+            <input type="number" id="barrier" value="5" min="0" max="9" />
+          </label>
+
+          <label>Stake (USD)
+            <input type="number" id="stake" value="0.35" min="0.35" step="0.01" />
+          </label>
+
+          <label>Ticks per trade
+            <input type="number" id="ticks" value="1" min="1" max="10" />
+          </label>
+
+          <button class="btn-start" id="startBtn" disabled>▶ Start Bot</button>
+          <button class="btn-stop" id="stopBtn" disabled>■ Stop Bot</button>
+        </div>
+
+        <!-- STATUS PANEL -->
+        <div class="panel status-panel">
+          <h2>Status</h2>
+
+          <div class="status-grid">
+            <div class="stat">
+              <div class="stat-label">Balance</div>
+              <div class="stat-value" id="balance">—</div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">Trades</div>
+              <div class="stat-value" id="tradeCount">0</div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">Wins</div>
+              <div class="stat-value win" id="wins">0</div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">Losses</div>
+              <div class="stat-value loss" id="losses">0</div>
+            </div>
+          </div>
+
+          <div class="log-box" id="logBox"></div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="footer">
+    <p>Speed Bot · Demo account only · Not financial advice</p>
+  </footer>
+
+  <script src="script.js"></script>
+</body>
+</html>
