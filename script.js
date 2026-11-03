@@ -7,7 +7,7 @@
 // ⚠️ REPLACE WITH YOUR DERIV OAUTH APP ID
 // Register at: https://developers.deriv.com
 // Redirect URI must match EXACTLY what you register.
-const CLIENT_ID = "YOUR_APP_ID_HERE"; // e.g. "app12345"
+const CLIENT_ID = "34RaG6zRPpQYEeugvLnPq"; // e.g. "app12345"
 const REDIRECT_URI = window.location.origin + window.location.pathname;
 const AUTH_URL = "https://auth.deriv.com/oauth2/auth";
 const TOKEN_URL = "https://auth.deriv.com/oauth2/token";
