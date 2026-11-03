@@ -21,6 +21,17 @@
         <span class="brand-mark">⚡</span>
         Speed Bot
       </div>
+      
+      <!-- ACCOUNT SWITCHER -->
+      <div class="account-switcher" id="accountSwitcher" style="display: none;">
+        <div class="account-pill demo active" id="pillDemo">
+          <span class="flag">🇺🇸</span> Demo: <span id="demoAccId">—</span>
+        </div>
+        <div class="account-pill real" id="pillReal">
+          <span class="flag">🇺🇸</span> Real: <span id="realAccId">—</span>
+        </div>
+      </div>
+
       <div class="auth-status" id="authStatus">
         <span class="auth-dot" id="authDot"></span>
         <span id="authText">Not logged in</span>
@@ -30,34 +41,57 @@
 
   <main class="container">
 
-    <!-- LOGIN CARD (shown when not logged in) -->
+    <!-- LOGIN CARD -->
     <section class="login-card" id="loginCard">
       <div class="login-icon">🔐</div>
       <h1>Connect to Deriv</h1>
-      <p class="login-sub">Log in with your Deriv account to start the speed bot. Your token stays in your browser — it never touches our servers.</p>
-
+      <p class="login-sub">Log in to start the speed bot. Your token stays in your browser.</p>
       <button class="btn-login" id="loginBtn">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/>
-          <polyline points="10 17 15 12 10 7"/>
-          <line x1="15" y1="12" x2="3" y2="12"/>
-        </svg>
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>
         Login to Deriv
       </button>
-
-      <div class="login-note">
-        <strong>Demo account only.</strong> You'll be redirected to Deriv to authorise. No real funds are touched.
-      </div>
     </section>
 
-    <!-- BOT DASHBOARD (shown when logged in) -->
+    <!-- BOT DASHBOARD -->
     <section class="bot-dashboard" id="botDashboard">
       <div class="dashboard-header">
         <div>
           <h1>Speed Bot</h1>
-          <p class="dashboard-sub" id="accountInfo">Connected</p>
+          <p class="dashboard-sub">Target: <strong id="activeAccLabel" style="color: var(--cyan);">—</strong></p>
+        </div>
+        <div class="balance-display">
+          <span class="balance-label">Balance</span>
+          <span class="balance-value" id="balance">$0.00</span>
         </div>
         <button class="btn-logout" id="logoutBtn">Logout</button>
+      </div>
+
+      <!-- MARTINGALE BANNER -->
+      <div class="martingale-banner">
+        <div class="mb-header">
+          <span>⚙️ Martingale Settings</span>
+          <span class="mb-status" id="mbStatus">Step 1 / 1x</span>
+        </div>
+        <div class="mb-controls">
+          <label>Multiplier
+            <select id="martingaleMultiplier">
+              <option value="1.5">1.5x</option>
+              <option value="2.0" selected>2.0x</option>
+              <option value="3.0">3.0x</option>
+            </select>
+          </label>
+          <label>Max Steps
+            <select id="martingaleMaxSteps">
+              <option value="2">2</option>
+              <option value="3" selected>3</option>
+              <option value="4">4</option>
+              <option value="5">5</option>
+            </select>
+          </label>
+          <div class="mb-hook-info">
+            Virtual Hook: <strong>2 ticks</strong> recovery wait
+          </div>
+        </div>
       </div>
 
       <div class="bot-grid">
@@ -65,7 +99,7 @@
         <div class="panel config-panel">
           <h2>Configuration</h2>
 
-          <label>Market
+          <label>Market (10 Indices)
             <select id="marketSelect">
               <option value="R_10">V10</option>
               <option value="R_25">V25</option>
@@ -73,6 +107,9 @@
               <option value="R_75">V75</option>
               <option value="R_100" selected>V100</option>
               <option value="1HZ10V">V10 1s</option>
+              <option value="1HZ25V">V25 1s</option>
+              <option value="1HZ50V">V50 1s</option>
+              <option value="1HZ75V">V75 1s</option>
               <option value="1HZ100V">V100 1s</option>
             </select>
           </label>
@@ -87,15 +124,11 @@
           </label>
 
           <label>Barrier (0–9)
-            <input type="number" id="barrier" value="5" min="0" max="9" />
+            <input type="number" id="barrier" value="8" min="0" max="9" />
           </label>
 
-          <label>Stake (USD)
+          <label>Base Stake (USD)
             <input type="number" id="stake" value="0.35" min="0.35" step="0.01" />
-          </label>
-
-          <label>Ticks per trade
-            <input type="number" id="ticks" value="1" min="1" max="10" />
           </label>
 
           <button class="btn-start" id="startBtn" disabled>▶ Start Bot</button>
@@ -108,11 +141,7 @@
 
           <div class="status-grid">
             <div class="stat">
-              <div class="stat-label">Balance</div>
-              <div class="stat-value" id="balance">—</div>
-            </div>
-            <div class="stat">
-              <div class="stat-label">Trades</div>
+              <div class="stat-label">Current Streak</div>
               <div class="stat-value" id="tradeCount">0</div>
             </div>
             <div class="stat">
@@ -122,6 +151,10 @@
             <div class="stat">
               <div class="stat-label">Losses</div>
               <div class="stat-value loss" id="losses">0</div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">Bot State</div>
+              <div class="stat-value" id="botState" style="font-size: 0.9rem; color: var(--amber);">IDLE</div>
             </div>
           </div>
 
@@ -133,7 +166,7 @@
   </main>
 
   <footer class="footer">
-    <p>Speed Bot · Demo account only · Not financial advice</p>
+    <p>Speed Bot · Not financial advice · Trade at your own risk</p>
   </footer>
 
   <script src="script.js"></script>
