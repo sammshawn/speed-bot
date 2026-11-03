@@ -22,7 +22,6 @@
         Speed Bot
       </div>
       
-      <!-- ACCOUNT SWITCHER -->
       <div class="account-switcher" id="accountSwitcher" style="display: none;">
         <div class="account-pill demo active" id="pillDemo">
           <span class="flag">🇺🇸</span> Demo: <span id="demoAccId">—</span>
@@ -41,7 +40,6 @@
 
   <main class="container">
 
-    <!-- LOGIN CARD -->
     <section class="login-card" id="loginCard">
       <div class="login-icon">🔐</div>
       <h1>Connect to Deriv</h1>
@@ -52,7 +50,6 @@
       </button>
     </section>
 
-    <!-- BOT DASHBOARD -->
     <section class="bot-dashboard" id="botDashboard">
       <div class="dashboard-header">
         <div>
@@ -66,7 +63,6 @@
         <button class="btn-logout" id="logoutBtn">Logout</button>
       </div>
 
-      <!-- MARTINGALE BANNER -->
       <div class="martingale-banner">
         <div class="mb-header">
           <span>⚙️ Martingale Settings</span>
@@ -95,7 +91,6 @@
       </div>
 
       <div class="bot-grid">
-        <!-- CONFIG PANEL -->
         <div class="panel config-panel">
           <h2>Configuration</h2>
 
@@ -135,13 +130,12 @@
           <button class="btn-stop" id="stopBtn" disabled>■ Stop Bot</button>
         </div>
 
-        <!-- STATUS PANEL -->
         <div class="panel status-panel">
           <h2>Status</h2>
 
           <div class="status-grid">
             <div class="stat">
-              <div class="stat-label">Current Streak</div>
+              <div class="stat-label">Trades</div>
               <div class="stat-value" id="tradeCount">0</div>
             </div>
             <div class="stat">
@@ -169,6 +163,7 @@
     <p>Speed Bot · Not financial advice · Trade at your own risk</p>
   </footer>
 
-  <script src="script.js"></script>
+  <!-- CACHE BUSTER ADDED HERE -->
+  <script src="script.js?v=2.0"></script>
 </body>
 </html>

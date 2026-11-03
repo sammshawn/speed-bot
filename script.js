@@ -1,5 +1,5 @@
 // ============================================
-//  SPEED BOT — WebSocket Balance + Strict Trading
+//  SPEED BOT — V2.0 (Strict State Machine)
 // ============================================
 
 const CLIENT_ID = "34RaG6zRPpQYEeugvLnPq";
@@ -14,14 +14,11 @@ let activeAccount = null;
 let ws = null;
 let reqId = 1;
 
-// Bot State
-let botRunning = false;
-let currentState = "IDLE"; // IDLE, TRADING, HOOK, STOPPED
+// Bot State Machine
+let botState = "IDLE"; // IDLE, TRADING, HOOK, WAITING_RESULT
 let hookTicksCount = 0;
 let currentMartingaleStep = 1;
-let wins = 0, losses = 0;
-let isTradeActive = false; // Locks new trades while one is processing
-let currentContractId = null;
+let wins = 0, losses = 0, totalTrades = 0;
 
 // DOM
 const loginCard = document.getElementById("loginCard");
@@ -37,6 +34,7 @@ const demoAccId = document.getElementById("demoAccId");
 const realAccId = document.getElementById("realAccId");
 const activeAccLabel = document.getElementById("activeAccLabel");
 const balanceEl = document.getElementById("balance");
+const tradeCountEl = document.getElementById("tradeCount");
 const winsEl = document.getElementById("wins");
 const lossesEl = document.getElementById("losses");
 const botStateEl = document.getElementById("botState");
@@ -58,14 +56,12 @@ function log(msg, type = "info") {
   const entry = document.createElement("div");
   entry.className = `log-entry ${type}`;
   const time = new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute:'2-digit', second:'2-digit' });
-  
-  // Clean up the message for the UI
   entry.textContent = `[${time}] ${msg}`;
   logBox.appendChild(entry);
   logBox.scrollTop = logBox.scrollHeight;
 }
 
-// ---- PKCE LOGIN ----
+// ---- AUTH PKCE ----
 function generatePKCE() {
   const array = crypto.getRandomValues(new Uint8Array(64));
   const codeVerifier = Array.from(array).map(v => 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~'[v % 66]).join('');
@@ -74,6 +70,7 @@ function generatePKCE() {
   sessionStorage.setItem('oauth_state', state);
   return { codeVerifier, state };
 }
+
 async function generateCodeChallenge(verifier) {
   const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
   return btoa(String.fromCharCode(...new Uint8Array(hash))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -115,7 +112,7 @@ async function handleCallback() {
   } catch (err) { log(`Network error: ${err.message}`, "error"); return false; }
 }
 
-// ---- FETCH ACCOUNTS (REST is fine here, no CORS issue for /accounts) ----
+// ---- FETCH ACCOUNTS ----
 async function fetchAccounts() {
   try {
     const res = await fetch(`${API_BASE}/accounts`, { headers: { "Authorization": `Bearer ${accessToken}` } });
@@ -155,9 +152,9 @@ pillReal.addEventListener("click", () => {
   if (real) selectAccount(real);
 });
 
-// ---- WEBSOCKET & TRADING ENGINE ----
+// ---- WEBSOCKET CONNECTION ----
 async function connectWS() {
-  log("Connecting...", "info");
+  log("Connecting to Deriv...", "info");
   try {
     const res = await fetch(`${API_BASE}/accounts/${activeAccount.id}/otp`, {
       method: "POST", headers: { "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" }
@@ -179,8 +176,7 @@ async function connectWS() {
       
       startBtn.disabled = true;
       stopBtn.disabled = false;
-      botRunning = true;
-      currentState = "TRADING";
+      botState = "TRADING";
       updateBotStateUI();
     };
 
@@ -189,7 +185,6 @@ async function connectWS() {
       if (msg.error) { log(`WS Error: ${msg.error.message}`, "error"); return; }
       
       if (msg.msg_type === "balance") {
-        // Update balance from WebSocket
         balanceEl.textContent = `$${parseFloat(msg.balance.balance).toFixed(2)}`;
       }
       
@@ -209,19 +204,20 @@ function subscribeTicks() {
   ws.send(JSON.stringify({ ticks: marketSelect.value, subscribe: 1, req_id: reqId++ }));
 }
 
-// --- THE VIRTUAL HOOK & TRADING LOGIC ---
+// --- THE STATE MACHINE ----
 function handleTick(tick) {
-  if (!botRunning || isTradeActive) return; // Lock prevents trading if one is active
+  // 🚨 LOCK: Do absolutely nothing if a trade is active or we are waiting for a result
+  if (botState === "WAITING_RESULT" || botState === "IDLE" || botState === "STOPPED") return;
 
-  if (currentState === "HOOK") {
+  if (botState === "HOOK") {
     const digit = getLastDigit(tick.quote);
     const isWinCondition = checkWinCondition(digit);
     
     if (isWinCondition) {
       hookTicksCount++;
       if (hookTicksCount >= 2) {
-        log(`Hook fired. Placing recovery...`, "success");
-        currentState = "TRADING";
+        log(`Hook fired. Recovering...`, "success");
+        botState = "WAITING_RESULT"; // Lock before firing
         placeTrade();
       }
     } else {
@@ -230,7 +226,8 @@ function handleTick(tick) {
     return; 
   }
 
-  if (currentState === "TRADING") {
+  if (botState === "TRADING") {
+    botState = "WAITING_RESULT"; // Lock immediately
     placeTrade();
   }
 }
@@ -256,8 +253,6 @@ function checkWinCondition(digit) {
 
 function placeTrade() {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  
-  isTradeActive = true; // Lock it
   
   const stake = parseFloat(stakeInput.value);
   const type = contractType.value;
@@ -291,7 +286,8 @@ function handleProposal(proposal) {
 }
 
 function handleBuy(buy) {
-  currentContractId = buy.contract_id;
+  totalTrades++;
+  tradeCountEl.textContent = totalTrades;
   log(`Bought ${contractType.value} $${buy.buy_price}`, "trade");
   
   ws.send(JSON.stringify({
@@ -312,7 +308,7 @@ function handleContractUpdate(contract) {
     log(`WIN +$${profit.toFixed(2)}`, "success");
     currentMartingaleStep = 1;
     updateMartingaleUI();
-    currentState = "TRADING"; 
+    botState = "TRADING"; // Unlock to continue normal trading
   } else {
     losses++;
     lossesEl.textContent = losses;
@@ -320,7 +316,7 @@ function handleContractUpdate(contract) {
     
     const maxSteps = parseInt(martingaleMaxSteps.value, 10);
     if (currentMartingaleStep >= maxSteps) {
-      log(`Max Steps reached. Stopped.`, "error");
+      log(`Max Steps reached. Stopping.`, "error");
       stopBot();
       return;
     }
@@ -331,12 +327,11 @@ function handleContractUpdate(contract) {
     stakeInput.value = newStake;
     updateMartingaleUI();
 
-    currentState = "HOOK";
+    botState = "HOOK"; // Enter Hook, do not unlock
     hookTicksCount = 0;
-    log(`Waiting for hook...`, "info");
+    log(`Hook active. Waiting for 2 wins...`, "info");
   }
   
-  isTradeActive = false; // Unlock for the next trade
   ws.send(JSON.stringify({ forget: contract.id, req_id: reqId++ }));
   updateBotStateUI();
 }
@@ -347,17 +342,17 @@ function updateMartingaleUI() {
 }
 
 function updateBotStateUI() {
-  botStateEl.textContent = currentState;
+  botStateEl.textContent = botState;
   botStateEl.style.color = 
-    currentState === "TRADING" ? "var(--green)" : 
-    currentState === "HOOK" ? "var(--amber)" : "var(--muted)";
+    botState === "TRADING" ? "var(--green)" : 
+    botState === "HOOK" ? "var(--amber)" : "var(--muted)";
 }
 
 // ---- CONTROLS ----
 startBtn.addEventListener("click", () => {
   if (!activeAccount) return;
   if (activeAccount.type === "real") {
-    if (!confirm("⚠️ WARNING: You are about to trade on a REAL account. Real money will be used. Are you sure?")) return;
+    if (!confirm("⚠️ WARNING: Real money trading. Are you sure?")) return;
   }
   connectWS();
 });
@@ -365,8 +360,7 @@ startBtn.addEventListener("click", () => {
 stopBtn.addEventListener("click", stopBot);
 
 function stopBot() {
-  botRunning = false;
-  currentState = "STOPPED";
+  botState = "STOPPED";
   if (ws) { ws.close(); ws = null; }
   startBtn.disabled = false;
   stopBtn.disabled = true;
