@@ -1,5 +1,5 @@
 // ============================================
-//  SPEED BOT — Continuous Tick + Virtual Hook
+//  SPEED BOT — WebSocket Balance + Strict Trading
 // ============================================
 
 const CLIENT_ID = "34RaG6zRPpQYEeugvLnPq";
@@ -10,7 +10,7 @@ const API_BASE = "https://api.derivws.com/trading/v1/options";
 
 let accessToken = null;
 let accounts = [];
-let activeAccount = null; // { id, type: 'demo'|'real', balance }
+let activeAccount = null;
 let ws = null;
 let reqId = 1;
 
@@ -20,6 +20,8 @@ let currentState = "IDLE"; // IDLE, TRADING, HOOK, STOPPED
 let hookTicksCount = 0;
 let currentMartingaleStep = 1;
 let wins = 0, losses = 0;
+let isTradeActive = false; // Locks new trades while one is processing
+let currentContractId = null;
 
 // DOM
 const loginCard = document.getElementById("loginCard");
@@ -35,7 +37,6 @@ const demoAccId = document.getElementById("demoAccId");
 const realAccId = document.getElementById("realAccId");
 const activeAccLabel = document.getElementById("activeAccLabel");
 const balanceEl = document.getElementById("balance");
-const tradeCountEl = document.getElementById("tradeCount");
 const winsEl = document.getElementById("wins");
 const lossesEl = document.getElementById("losses");
 const botStateEl = document.getElementById("botState");
@@ -50,13 +51,15 @@ const stakeInput = document.getElementById("stake");
 const martingaleMultiplier = document.getElementById("martingaleMultiplier");
 const martingaleMaxSteps = document.getElementById("martingaleMaxSteps");
 
-// ---- LOGGING ----
+// ---- CLEAN LOGGING ----
 function log(msg, type = "info") {
   console.log(`[${type}]`, msg);
   if (!logBox) return;
   const entry = document.createElement("div");
   entry.className = `log-entry ${type}`;
-  const time = new Date().toLocaleTimeString();
+  const time = new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute:'2-digit', second:'2-digit' });
+  
+  // Clean up the message for the UI
   entry.textContent = `[${time}] ${msg}`;
   logBox.appendChild(entry);
   logBox.scrollTop = logBox.scrollHeight;
@@ -112,9 +115,8 @@ async function handleCallback() {
   } catch (err) { log(`Network error: ${err.message}`, "error"); return false; }
 }
 
-// ---- FETCH ACCOUNTS & BALANCE ----
+// ---- FETCH ACCOUNTS (REST is fine here, no CORS issue for /accounts) ----
 async function fetchAccounts() {
-  log("Fetching accounts…", "info");
   try {
     const res = await fetch(`${API_BASE}/accounts`, { headers: { "Authorization": `Bearer ${accessToken}` } });
     const data = await res.json();
@@ -127,7 +129,6 @@ async function fetchAccounts() {
     if (demo) demoAccId.textContent = demo.account_id;
     if (real) realAccId.textContent = real.account_id;
 
-    // Default to Demo
     if (demo) selectAccount(demo);
     else if (real) selectAccount(real);
     
@@ -136,25 +137,13 @@ async function fetchAccounts() {
   } catch (err) { log(`Account fetch failed: ${err.message}`, "error"); return false; }
 }
 
-async function fetchBalance(accId) {
-  try {
-    const res = await fetch(`${API_BASE}/accounts/${accId}/balance`, { headers: { "Authorization": `Bearer ${accessToken}` } });
-    const data = await res.json();
-    if (res.ok && data.data) {
-      activeAccount.balance = data.data.balance;
-      balanceEl.textContent = `$${parseFloat(data.data.balance).toFixed(2)}`;
-    }
-  } catch (e) { console.warn("Balance error", e); }
-}
-
 function selectAccount(acc) {
   activeAccount = { id: acc.account_id, type: acc.type || acc.account_type };
   pillDemo.classList.toggle("active", activeAccount.type === "demo");
   pillReal.classList.toggle("active", activeAccount.type === "real");
   activeAccLabel.textContent = `${activeAccount.type.toUpperCase()} (${activeAccount.id})`;
-  fetchBalance(activeAccount.id);
+  balanceEl.textContent = "Loading...";
   startBtn.disabled = false;
-  log(`Switched to ${activeAccount.type} account: ${activeAccount.id}`, "success");
 }
 
 pillDemo.addEventListener("click", () => {
@@ -168,7 +157,7 @@ pillReal.addEventListener("click", () => {
 
 // ---- WEBSOCKET & TRADING ENGINE ----
 async function connectWS() {
-  log("Getting OTP for WebSocket…", "info");
+  log("Connecting...", "info");
   try {
     const res = await fetch(`${API_BASE}/accounts/${activeAccount.id}/otp`, {
       method: "POST", headers: { "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" }
@@ -176,12 +165,18 @@ async function connectWS() {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error?.message || "OTP failed");
     
-    const wsUrl = data.data.url; // wss://...?otp=...
+    const wsUrl = data.data.url; 
     ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {
-      log("✅ WebSocket Connected", "success");
+      log("Connected.", "success");
+      
+      // 1. Subscribe to balance via WebSocket (Fixes CORS)
+      ws.send(JSON.stringify({ balance: 1, subscribe: 1, req_id: reqId++ }));
+      
+      // 2. Subscribe to ticks
       subscribeTicks();
+      
       startBtn.disabled = true;
       stopBtn.disabled = false;
       botRunning = true;
@@ -193,15 +188,20 @@ async function connectWS() {
       const msg = JSON.parse(event.data);
       if (msg.error) { log(`WS Error: ${msg.error.message}`, "error"); return; }
       
+      if (msg.msg_type === "balance") {
+        // Update balance from WebSocket
+        balanceEl.textContent = `$${parseFloat(msg.balance.balance).toFixed(2)}`;
+      }
+      
       if (msg.msg_type === "tick") handleTick(msg.tick);
       if (msg.msg_type === "proposal") handleProposal(msg.proposal);
       if (msg.msg_type === "buy") handleBuy(msg.buy);
       if (msg.msg_type === "proposal_open_contract") handleContractUpdate(msg.proposal_open_contract);
     };
 
-    ws.onclose = () => { log("WebSocket disconnected", "info"); stopBot(); };
+    ws.onclose = () => { log("Disconnected.", "info"); stopBot(); };
 
-  } catch (err) { log(`OTP Connection failed: ${err.message}`, "error"); }
+  } catch (err) { log(`Connection failed: ${err.message}`, "error"); }
 }
 
 function subscribeTicks() {
@@ -211,29 +211,25 @@ function subscribeTicks() {
 
 // --- THE VIRTUAL HOOK & TRADING LOGIC ---
 function handleTick(tick) {
-  if (!botRunning) return;
+  if (!botRunning || isTradeActive) return; // Lock prevents trading if one is active
 
-  // If we are in the HOOK phase, evaluate the virtual condition
   if (currentState === "HOOK") {
     const digit = getLastDigit(tick.quote);
     const isWinCondition = checkWinCondition(digit);
     
     if (isWinCondition) {
       hookTicksCount++;
-      log(`🪝 Hook confirmed (${hookTicksCount}/2)`, "trade");
       if (hookTicksCount >= 2) {
-        log(`🚀 Hook fired! Placing recovery trade (Step ${currentMartingaleStep})`, "success");
+        log(`Hook fired. Placing recovery...`, "success");
         currentState = "TRADING";
         placeTrade();
       }
     } else {
-      if (hookTicksCount > 0) log(`Hook broken. Resetting to 0.`, "info");
       hookTicksCount = 0;
     }
-    return; // Do not place a normal trade while in HOOK
+    return; 
   }
 
-  // If we are TRADING normally
   if (currentState === "TRADING") {
     placeTrade();
   }
@@ -261,6 +257,8 @@ function checkWinCondition(digit) {
 function placeTrade() {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   
+  isTradeActive = true; // Lock it
+  
   const stake = parseFloat(stakeInput.value);
   const type = contractType.value;
   const barrier = parseInt(barrierInput.value, 10);
@@ -285,7 +283,6 @@ function placeTrade() {
 }
 
 function handleProposal(proposal) {
-  // Immediately buy the proposal
   ws.send(JSON.stringify({
     buy: proposal.id,
     price: proposal.ask_price,
@@ -294,8 +291,9 @@ function handleProposal(proposal) {
 }
 
 function handleBuy(buy) {
-  log(`📈 Bought ${contractType.value} for $${buy.buy_price}`, "trade");
-  // Subscribe to contract result
+  currentContractId = buy.contract_id;
+  log(`Bought ${contractType.value} $${buy.buy_price}`, "trade");
+  
   ws.send(JSON.stringify({
     proposal_open_contract: 1,
     contract_id: buy.contract_id,
@@ -305,51 +303,40 @@ function handleBuy(buy) {
 }
 
 function handleContractUpdate(contract) {
-  if (!contract.is_sold) return; // Wait for result
+  if (!contract.is_sold) return; 
 
   const profit = parseFloat(contract.profit);
   if (profit > 0) {
-    // WIN
     wins++;
     winsEl.textContent = wins;
-    log(`✅ WIN: +$${profit.toFixed(2)}`, "success");
-    
-    // Reset Martingale
+    log(`WIN +$${profit.toFixed(2)}`, "success");
     currentMartingaleStep = 1;
     updateMartingaleUI();
-    currentState = "TRADING"; // Go back to normal trading
-    fetchBalance(activeAccount.id);
-    
+    currentState = "TRADING"; 
   } else {
-    // LOSS
     losses++;
     lossesEl.textContent = losses;
-    log(`❌ LOSS: -$${Math.abs(profit).toFixed(2)}`, "error");
+    log(`LOSS -$${Math.abs(profit).toFixed(2)}`, "error");
     
     const maxSteps = parseInt(martingaleMaxSteps.value, 10);
     if (currentMartingaleStep >= maxSteps) {
-      log(`🛑 Max Martingale Steps (${maxSteps}) reached. Bot stopped.`, "error");
+      log(`Max Steps reached. Stopped.`, "error");
       stopBot();
       return;
     }
 
-    // Increase Martingale
     currentMartingaleStep++;
     const multiplier = parseFloat(martingaleMultiplier.value);
     const newStake = (parseFloat(stakeInput.value) * Math.pow(multiplier, currentMartingaleStep - 1)).toFixed(2);
-    log(`🔥 Martingale Step ${currentMartingaleStep}. Next stake: $${newStake}`, "trade");
     stakeInput.value = newStake;
-    
     updateMartingaleUI();
-    fetchBalance(activeAccount.id);
 
-    // ENTER VIRTUAL HOOK
     currentState = "HOOK";
     hookTicksCount = 0;
-    log(`🪝 Entering Virtual Hook. Waiting for 2 dominance ticks…`, "info");
+    log(`Waiting for hook...`, "info");
   }
   
-  // Unsubscribe from this contract
+  isTradeActive = false; // Unlock for the next trade
   ws.send(JSON.stringify({ forget: contract.id, req_id: reqId++ }));
   updateBotStateUI();
 }
@@ -372,7 +359,6 @@ startBtn.addEventListener("click", () => {
   if (activeAccount.type === "real") {
     if (!confirm("⚠️ WARNING: You are about to trade on a REAL account. Real money will be used. Are you sure?")) return;
   }
-  log(`Starting bot on ${activeAccount.type.toUpperCase()} account…`, "info");
   connectWS();
 });
 
@@ -385,7 +371,7 @@ function stopBot() {
   startBtn.disabled = false;
   stopBtn.disabled = true;
   updateBotStateUI();
-  log("🛑 Bot stopped by user.", "info");
+  log("Bot stopped.", "info");
 }
 
 logoutBtn.addEventListener("click", () => {
