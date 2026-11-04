@@ -1,5 +1,5 @@
 // ============================================
-//  SPEED BOT — V2.0 (Strict State Machine)
+//  SPEED BOT — V3.0 (Instant Connection)
 // ============================================
 
 const CLIENT_ID = "34RaG6zRPpQYEeugvLnPq";
@@ -14,7 +14,8 @@ let activeAccount = null;
 let ws = null;
 let reqId = 1;
 
-// Bot State Machine
+// Engine State
+let isExecuting = false; // Controlled by Start/Stop button
 let botState = "IDLE"; // IDLE, TRADING, HOOK, WAITING_RESULT
 let hookTicksCount = 0;
 let currentMartingaleStep = 1;
@@ -92,9 +93,9 @@ async function handleCallback() {
   const code = urlParams.get('code');
   const state = urlParams.get('state');
   if (!code || !state) return false;
-  if (state !== sessionStorage.getItem('oauth_state')) { log("State mismatch.", "error"); return false; }
+  if (state !== sessionStorage.getItem('oauth_state')) { log("State mismatch.", "loss"); return false; }
   const codeVerifier = sessionStorage.getItem('pkce_code_verifier');
-  if (!codeVerifier) { log("PKCE missing.", "error"); return false; }
+  if (!codeVerifier) { log("PKCE missing.", "loss"); return false; }
 
   try {
     const response = await fetch(TOKEN_URL, {
@@ -102,17 +103,17 @@ async function handleCallback() {
       body: new URLSearchParams({ grant_type: "authorization_code", client_id: CLIENT_ID, code, redirect_uri: REDIRECT_URI, code_verifier: codeVerifier }),
     });
     const data = await response.json();
-    if (!response.ok) { log(`Token error: ${data.error_description || data.error}`, "error"); return false; }
+    if (!response.ok) { log(`Token error: ${data.error_description || data.error}`, "loss"); return false; }
     accessToken = data.access_token;
     sessionStorage.setItem('deriv_access_token', accessToken);
     sessionStorage.removeItem('pkce_code_verifier');
     sessionStorage.removeItem('oauth_state');
     window.history.replaceState({}, document.title, window.location.pathname);
     return true;
-  } catch (err) { log(`Network error: ${err.message}`, "error"); return false; }
+  } catch (err) { log(`Network error: ${err.message}`, "loss"); return false; }
 }
 
-// ---- FETCH ACCOUNTS ----
+// ---- FETCH ACCOUNTS & CONNECT ----
 async function fetchAccounts() {
   try {
     const res = await fetch(`${API_BASE}/accounts`, { headers: { "Authorization": `Bearer ${accessToken}` } });
@@ -131,16 +132,22 @@ async function fetchAccounts() {
     
     accountSwitcher.style.display = "flex";
     return true;
-  } catch (err) { log(`Account fetch failed: ${err.message}`, "error"); return false; }
+  } catch (err) { log(`Account fetch failed: ${err.message}`, "loss"); return false; }
 }
 
-function selectAccount(acc) {
+// 🚨 THE INSTANT CONNECTION
+async function selectAccount(acc) {
   activeAccount = { id: acc.account_id, type: acc.type || acc.account_type };
   pillDemo.classList.toggle("active", activeAccount.type === "demo");
   pillReal.classList.toggle("active", activeAccount.type === "real");
   activeAccLabel.textContent = `${activeAccount.type.toUpperCase()} (${activeAccount.id})`;
-  balanceEl.textContent = "Loading...";
-  startBtn.disabled = false;
+  balanceEl.textContent = "Connecting...";
+  
+  // Kill old connection
+  if (ws) { ws.close(); ws = null; }
+  
+  // Connect immediately
+  await connectWS();
 }
 
 pillDemo.addEventListener("click", () => {
@@ -154,7 +161,6 @@ pillReal.addEventListener("click", () => {
 
 // ---- WEBSOCKET CONNECTION ----
 async function connectWS() {
-  log("Connecting to Deriv...", "info");
   try {
     const res = await fetch(`${API_BASE}/accounts/${activeAccount.id}/otp`, {
       method: "POST", headers: { "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" }
@@ -166,37 +172,40 @@ async function connectWS() {
     ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {
-      log("Connected.", "success");
-      
-      // 1. Subscribe to balance via WebSocket (Fixes CORS)
+      // 1. Subscribe to balance
       ws.send(JSON.stringify({ balance: 1, subscribe: 1, req_id: reqId++ }));
       
       // 2. Subscribe to ticks
       subscribeTicks();
       
-      startBtn.disabled = true;
-      stopBtn.disabled = false;
-      botState = "TRADING";
-      updateBotStateUI();
+      startBtn.disabled = false;
+      log("Account ready. Connection established.", "info");
     };
 
     ws.onmessage = (event) => {
       const msg = JSON.parse(event.data);
-      if (msg.error) { log(`WS Error: ${msg.error.message}`, "error"); return; }
+      if (msg.error) { log(`WS Error: ${msg.error.message}`, "loss"); return; }
       
       if (msg.msg_type === "balance") {
         balanceEl.textContent = `$${parseFloat(msg.balance.balance).toFixed(2)}`;
       }
       
+      // 🚨 Only process trading messages if the bot is running
+      if (!isExecuting) return;
+
       if (msg.msg_type === "tick") handleTick(msg.tick);
       if (msg.msg_type === "proposal") handleProposal(msg.proposal);
       if (msg.msg_type === "buy") handleBuy(msg.buy);
       if (msg.msg_type === "proposal_open_contract") handleContractUpdate(msg.proposal_open_contract);
     };
 
-    ws.onclose = () => { log("Disconnected.", "info"); stopBot(); };
+    ws.onclose = () => { 
+      log("Disconnected from account.", "info"); 
+      startBtn.disabled = true;
+      stopBot();
+    };
 
-  } catch (err) { log(`Connection failed: ${err.message}`, "error"); }
+  } catch (err) { log(`Connection failed: ${err.message}`, "loss"); }
 }
 
 function subscribeTicks() {
@@ -204,9 +213,8 @@ function subscribeTicks() {
   ws.send(JSON.stringify({ ticks: marketSelect.value, subscribe: 1, req_id: reqId++ }));
 }
 
-// --- THE STATE MACHINE ----
+// --- THE STATE MACHINE ---
 function handleTick(tick) {
-  // 🚨 LOCK: Do absolutely nothing if a trade is active or we are waiting for a result
   if (botState === "WAITING_RESULT" || botState === "IDLE" || botState === "STOPPED") return;
 
   if (botState === "HOOK") {
@@ -216,8 +224,8 @@ function handleTick(tick) {
     if (isWinCondition) {
       hookTicksCount++;
       if (hookTicksCount >= 2) {
-        log(`Hook fired. Recovering...`, "success");
-        botState = "WAITING_RESULT"; // Lock before firing
+        log(`Hook fired. Recovering...`, "trade");
+        botState = "WAITING_RESULT";
         placeTrade();
       }
     } else {
@@ -227,7 +235,7 @@ function handleTick(tick) {
   }
 
   if (botState === "TRADING") {
-    botState = "WAITING_RESULT"; // Lock immediately
+    botState = "WAITING_RESULT";
     placeTrade();
   }
 }
@@ -288,7 +296,6 @@ function handleProposal(proposal) {
 function handleBuy(buy) {
   totalTrades++;
   tradeCountEl.textContent = totalTrades;
-  log(`Bought ${contractType.value} $${buy.buy_price}`, "trade");
   
   ws.send(JSON.stringify({
     proposal_open_contract: 1,
@@ -302,21 +309,24 @@ function handleContractUpdate(contract) {
   if (!contract.is_sold) return; 
 
   const profit = parseFloat(contract.profit);
+  const type = contractType.value;
+  const barrier = barrierInput.value;
+  
   if (profit > 0) {
     wins++;
     winsEl.textContent = wins;
-    log(`WIN +$${profit.toFixed(2)}`, "success");
+    log(`${type} ${barrier} · $${stakeInput.value} · WIN +$${profit.toFixed(2)}`, "win");
     currentMartingaleStep = 1;
     updateMartingaleUI();
-    botState = "TRADING"; // Unlock to continue normal trading
+    botState = "TRADING"; 
   } else {
     losses++;
     lossesEl.textContent = losses;
-    log(`LOSS -$${Math.abs(profit).toFixed(2)}`, "error");
+    log(`${type} ${barrier} · $${stakeInput.value} · LOSS -$${Math.abs(profit).toFixed(2)}`, "loss");
     
     const maxSteps = parseInt(martingaleMaxSteps.value, 10);
     if (currentMartingaleStep >= maxSteps) {
-      log(`Max Steps reached. Stopping.`, "error");
+      log(`Max Steps reached. Stopping.`, "loss");
       stopBot();
       return;
     }
@@ -327,7 +337,7 @@ function handleContractUpdate(contract) {
     stakeInput.value = newStake;
     updateMartingaleUI();
 
-    botState = "HOOK"; // Enter Hook, do not unlock
+    botState = "HOOK"; 
     hookTicksCount = 0;
     log(`Hook active. Waiting for 2 wins...`, "info");
   }
@@ -350,22 +360,31 @@ function updateBotStateUI() {
 
 // ---- CONTROLS ----
 startBtn.addEventListener("click", () => {
-  if (!activeAccount) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    log("Not connected. Please wait or re-select account.", "loss");
+    return;
+  }
   if (activeAccount.type === "real") {
     if (!confirm("⚠️ WARNING: Real money trading. Are you sure?")) return;
   }
-  connectWS();
+  
+  isExecuting = true;
+  botState = "TRADING";
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
+  updateBotStateUI();
+  log("Bot execution started.", "info");
 });
 
 stopBtn.addEventListener("click", stopBot);
 
 function stopBot() {
+  isExecuting = false;
   botState = "STOPPED";
-  if (ws) { ws.close(); ws = null; }
   startBtn.disabled = false;
   stopBtn.disabled = true;
   updateBotStateUI();
-  log("Bot stopped.", "info");
+  log("Bot execution stopped.", "info");
 }
 
 logoutBtn.addEventListener("click", () => {
@@ -373,7 +392,8 @@ logoutBtn.addEventListener("click", () => {
   accessToken = null;
   accounts = [];
   activeAccount = null;
-  if (ws) ws.close();
+  isExecuting = false;
+  if (ws) { ws.close(); ws = null; }
   loginCard.style.display = "block";
   botDashboard.classList.remove("show");
   accountSwitcher.style.display = "none";
