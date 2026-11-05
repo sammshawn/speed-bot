@@ -1,5 +1,6 @@
 // ============================================
-//  SPEED BOT — V6.1 (Safe Proposal Handler)
+//  SPEED BOT — V7.0 (Queue Engine)
+//  Fixes: Proposals, Race Conditions, Freezing
 // ============================================
 
 const CLIENT_ID = "34RaG6zRPpQYEeugvLnPq";
@@ -20,19 +21,20 @@ let reconnectAttempts = 0;
 
 // Engine State
 let isExecuting = false; 
-let botState = "IDLE"; 
+let botState = "IDLE"; // IDLE, TRADING, HOOK, WAITING_RESULT
 let hookTicksCount = 0;
 let currentMartingaleStep = 1;
 let wins = 0, losses = 0, totalTrades = 0;
 let baseStake = 0.35;
 
-// Mutex & Safety
+// Mutex & Queue
 let isTradeActive = false; 
 let isProposalPending = false;
 let safetyTimeout = null; 
 
-// Proposal Caching
+// Proposal & Tick Queue
 let activeProposal = null; 
+let queuedTick = null; // 🚨 Holds a tick if we are waiting for a proposal
 let currentEntryPrice = null;
 let currentEntryDigit = null;
 
@@ -235,9 +237,12 @@ function subscribeTicks() {
   ws.send(JSON.stringify({ ticks: marketSelect.value, subscribe: 1, req_id: reqId++ }));
 }
 
-// --- VIRTUAL HOOK & TRADING LOGIC ---
+// --- THE QUEUE ENGINE ---
 function handleTick(tick) {
   if (isTradeActive || botState === "WAITING_RESULT" || botState === "IDLE" || botState === "STOPPED") return;
+
+  // If we have a queued tick, ignore new ones until the queue is processed
+  if (queuedTick) return;
 
   if (botState === "HOOK") {
     const digit = getLastDigit(tick.quote);
@@ -247,7 +252,8 @@ function handleTick(tick) {
       hookTicksCount++;
       if (hookTicksCount >= 2) {
         logInfo(`Hook fired. Recovering...`);
-        fireCachedTrade(tick.quote, digit);
+        queuedTick = { price: tick.quote, digit: digit };
+        tryProcessQueue();
       }
     } else {
       hookTicksCount = 0;
@@ -256,33 +262,28 @@ function handleTick(tick) {
   }
 
   if (botState === "TRADING") {
-    fireCachedTrade(tick.quote, getLastDigit(tick.quote));
+    queuedTick = { price: tick.quote, digit: getLastDigit(tick.quote) };
+    tryProcessQueue();
   }
 }
 
-function checkWinCondition(digit) {
-  const type = contractType.value;
-  const barrier = parseInt(barrierInput.value, 10);
-  if (type === "DIGITOVER") return digit > barrier;
-  if (type === "DIGITUNDER") return digit < barrier;
-  if (type === "DIGITEVEN") return digit % 2 === 0;
-  if (type === "DIGITODD") return digit % 2 !== 0;
-  return false;
-}
+// 🚨 THE FIX: Process the tick as soon as the proposal is ready
+function tryProcessQueue() {
+  if (!queuedTick) return;
 
-// 🚨 THREAD-SAFE BUY
-function fireCachedTrade(price, digit) {
   if (!activeProposal) {
-    logInfo("Waiting for fresh proposal...");
+    // We have a tick, but no proposal. Ask for one.
     fetchProposalInBackground();
-    return; 
+    return;
   }
 
+  // We have both! Fire the trade.
   isTradeActive = true; 
   botState = "WAITING_RESULT";
-  currentEntryPrice = price;
-  currentEntryDigit = digit;
-  
+  currentEntryPrice = queuedTick.price;
+  currentEntryDigit = queuedTick.digit;
+  queuedTick = null; // Clear the queue
+
   clearTimeout(safetyTimeout);
   safetyTimeout = setTimeout(() => {
     if (isTradeActive) {
@@ -317,19 +318,13 @@ function fetchProposalInBackground() {
   ws.send(JSON.stringify(req));
 }
 
-// 🚨 SAFE PROPOSAL HANDLER (Fixes the crash)
 function handleProposal(proposal) {
   isProposalPending = false;
-
-  if (botState === "WAITING_RESULT") {
-    activeProposal = { id: proposal.id, ask_price: proposal.ask_price, sessionId: sessionId };
-  } else if (botState === "TRADING" || botState === "HOOK") {
-    // If a tick fired before the proposal arrived, buy immediately
-    isTradeActive = true;
-    botState = "WAITING_RESULT";
-    currentEntryPrice = proposal.echo_req?.amount ? null : currentEntryPrice; // fallback
-    
-    ws.send(JSON.stringify({ buy: proposal.id, price: proposal.ask_price, req_id: reqId++ }));
+  activeProposal = { id: proposal.id, ask_price: proposal.ask_price };
+  
+  // If a tick is waiting in the queue, fire it now!
+  if (queuedTick) {
+    tryProcessQueue();
   }
 }
 
@@ -385,7 +380,10 @@ function handleContractUpdate(contract) {
   }
   
   isTradeActive = false;
+  queuedTick = null; // Clear any stale ticks
   ws.send(JSON.stringify({ forget: contract.id, req_id: reqId++ }));
+  
+  // Pre-fetch the next proposal
   fetchProposalInBackground();
 }
 
@@ -404,6 +402,8 @@ startBtn.addEventListener("click", () => {
   botState = "TRADING";
   isTradeActive = false;
   isProposalPending = false;
+  activeProposal = null;
+  queuedTick = null;
   startBtn.disabled = true;
   stopBtn.disabled = false;
   logInfo("Bot execution started.");
@@ -420,6 +420,7 @@ function stopBot() {
   isTradeActive = false;
   isProposalPending = false;
   activeProposal = null;
+  queuedTick = null;
   clearTimeout(safetyTimeout);
   startBtn.disabled = false;
   stopBtn.disabled = true;
