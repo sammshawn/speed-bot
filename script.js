@@ -1,5 +1,5 @@
 // ============================================
-//  SPEED BOT — V8.0 (Direct-Buy Engine)
+//  SPEED BOT — V8.1 (Direct-Buy Engine)
 //  - No proposals: trades are bought directly with `buy: 1` + `parameters`
 //  - One trade at a time, watchdog timers can never deadlock
 //  - Every API error is routed + logged, nothing fails silently
@@ -33,6 +33,9 @@ let buyErrors = 0;
 let hookTicksCount = 0;
 let currentMartingaleStep = 1;
 let wins = 0, losses = 0, totalTrades = 0;
+let totalPL = 0;
+let lastTick = { price: null, digit: null };
+let pocSeen = false;
 let currentStake = 0.35;
 let currentEntry = { price: null, digit: null };
 const settledIds = new Set();
@@ -56,6 +59,7 @@ const balanceEl = $("balance");
 const tradeCountEl = $("tradeCount");
 const winsEl = $("wins");
 const lossesEl = $("losses");
+const totalPLEl = $("totalPL");
 const logBox = $("logBox");
 const clearLogBtn = $("clearLogBtn");
 const startBtn = $("startBtn");
@@ -118,17 +122,39 @@ function checkWinCondition(digit) {
 function timeNow() {
   return new Date().toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
+// Show a price with its last digit (the digit Deriv trades on) highlighted
+function fixDecimals(p, ref) {
+  const dec = (String(ref).split(".")[1] || "").length;
+  const have = (String(p).split(".")[1] || "").length;
+  return have < dec && Number.isFinite(Number(p)) ? Number(p).toFixed(dec) : String(p);
+}
+function priceHtml(price, digitClass) {
+  const s = String(price);
+  return `<span class="px">${s.slice(0, -1)}<span class="${digitClass} px-digit">${s.slice(-1)}</span></span>`;
+}
+function formatPL(pl) {
+  return pl >= 0 ? `+$${pl.toFixed(2)}` : `-$${Math.abs(pl).toFixed(2)}`;
+}
+function updateTotalPL() {
+  totalPLEl.textContent = formatPL(totalPL);
+  totalPLEl.style.color = totalPL > 0 ? "var(--green)" : totalPL < 0 ? "var(--red)" : "";
+}
 function logTrade(type, entryPrice, entryDigit, exitPrice, exitDigit, stake, pl) {
   const el = document.createElement("div");
   el.className = `log-entry ${type}`;
-  const plText = pl >= 0 ? `+$${pl.toFixed(2)}` : `-$${Math.abs(pl).toFixed(2)}`;
-  const plClass = pl >= 0 ? "pl-positive" : "pl-negative";
   const digitClass = type === "win" ? "digit-green" : "digit-red";
+  const plClass = pl >= 0 ? "pl-positive" : "pl-negative";
   el.innerHTML = `
-    <span class="log-time">${timeNow()}</span>
-    <span>Entry: <span class="${digitClass}">${entryDigit}</span> @ ${entryPrice}</span>
-    <span>Exit: <span class="${digitClass}">${exitDigit}</span> @ ${exitPrice}</span>
-    <span class="${plClass}">${plText} ($${Number(stake).toFixed(2)})</span>`;
+    <div class="log-side log-entry-side">
+      <span class="log-time">${timeNow()}</span>
+      ${priceHtml(entryPrice, digitClass)}
+      <span class="digit-badge ${digitClass}">${entryDigit}</span>
+    </div>
+    <div class="log-side log-exit-side">
+      ${priceHtml(exitPrice, digitClass)}
+      <span class="digit-badge ${digitClass}">${exitDigit}</span>
+      <span class="${plClass} log-pl">${formatPL(pl)} <small>($${Number(stake).toFixed(2)})</small></span>
+    </div>`;
   logBox.appendChild(el);
   logBox.scrollTop = logBox.scrollHeight;
 }
@@ -139,7 +165,8 @@ function logInfo(msg) {
   t.className = "log-time";
   t.textContent = timeNow();
   const m = document.createElement("span");
-  m.style.gridColumn = "span 3";
+  m.style.gridColumn = "2 / -1";
+  t.style.gridColumn = "1";
   m.textContent = msg;
   el.append(t, m);
   logBox.appendChild(el);
@@ -365,10 +392,10 @@ function handleError(msg) {
 // ---- ENGINE ----
 function handleTick(tick) {
   if (tick.symbol && tick.symbol !== marketSelect.value) return;
-  if (!isExecuting || tradeLock) return;
-
   const priceStr = formatTick(tick);
   const digit = lastDigit(priceStr);
+  lastTick = { price: priceStr, digit };   // always tracked, even while idle
+  if (!isExecuting || tradeLock) return;
 
   if (botState === "HOOK") {
     if (checkWinCondition(digit)) {
@@ -408,7 +435,7 @@ function placeTrade(entryPrice, entryDigit) {
   currentEntry = { price: entryPrice, digit: entryDigit };
   updateMartingaleUI();
 
-  const ok = send({ buy: 1, price: currentStake, parameters: params });
+  const ok = send({ buy: 1, price: currentStake, parameters: params, subscribe: 1 });
   if (!ok) {
     tradeLock = false;
     botState = stateBeforeTrade;
@@ -434,7 +461,13 @@ function handleBuy(buy) {
   currentContractId = buy.contract_id;
   if (buy.balance_after !== undefined) balanceEl.textContent = `$${parseFloat(buy.balance_after).toFixed(2)}`;
 
-  send({ proposal_open_contract: 1, contract_id: buy.contract_id, subscribe: 1 });
+  pocSeen = false;
+  const cid = buy.contract_id;
+  setTimeout(() => {
+    if (!pocSeen && tradeLock && currentContractId === cid) {
+      send({ proposal_open_contract: 1, contract_id: cid, subscribe: 1 });
+    }
+  }, 1500);
   armResultTimer(1);
 }
 
@@ -457,6 +490,7 @@ function armResultTimer(stage) {
 }
 
 function handleContractUpdate(c, subscription) {
+  if (c.contract_id === currentContractId) pocSeen = true;
   if (!c.is_sold) return;
   if (c.contract_id !== currentContractId) return;
   if (settledIds.has(c.contract_id)) return;
@@ -466,10 +500,13 @@ function handleContractUpdate(c, subscription) {
   if (subscription?.id) send({ forget: subscription.id });
 
   const profit = parseFloat(c.profit);
-  const entryPrice = c.entry_spot_display_value || c.entry_tick_display_value || c.entry_spot || currentEntry.price;
-  const exitPrice = c.exit_tick_display_value || c.exit_tick || c.sell_spot_display_value || currentEntry.price;
+  const entryPrice = String(c.entry_spot_display_value || c.entry_tick_display_value || c.entry_spot || currentEntry.price);
+  const exitPrice = fixDecimals(c.exit_tick_display_value || c.exit_tick || c.sell_spot_display_value || currentEntry.price, entryPrice);
   const entryDigit = lastDigit(entryPrice);
   const exitDigit = lastDigit(exitPrice);
+
+  totalPL += Number.isFinite(profit) ? profit : 0;
+  updateTotalPL();
 
   if (profit > 0) {
     wins++;
@@ -501,6 +538,9 @@ function handleContractUpdate(c, subscription) {
   tradeLock = false;
   currentContractId = null;
   updateMartingaleUI();
+
+  // Speed: in TRADING mode fire the next trade right now instead of waiting for another tick
+  if (isExecuting && botState === "TRADING") placeTrade(lastTick.price, lastTick.digit);
 }
 
 function updateMartingaleUI() {

@@ -8,7 +8,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="style.css?v=8.1" />
 </head>
 <body>
 
@@ -21,7 +21,7 @@
         <span class="brand-mark">⚡</span>
         Speed Bot
       </div>
-      
+
       <div class="account-switcher" id="accountSwitcher" style="display: none;">
         <div class="account-pill demo active" id="pillDemo">
           <span class="flag">🇺🇸</span> Demo: <span id="demoAccId">—</span>
@@ -66,7 +66,7 @@
       <div class="martingale-banner">
         <div class="mb-header">
           <span>⚙️ Martingale Settings</span>
-          <span class="mb-status" id="mbStatus">Step 1 / 1x</span>
+          <span class="mb-status" id="mbStatus">Step 1</span>
         </div>
         <div class="mb-controls">
           <label>Multiplier
@@ -155,16 +155,13 @@
             </div>
           </div>
 
-          <!-- LOG HEADERS -->
+          <!-- LOG HEADERS (two sides) -->
           <div class="log-headers">
-            <span>Time</span>
             <span>Entry</span>
-            <span>Exit</span>
-            <span>Stake</span>
-            <span>P/L</span>
+            <span>Exit · P/L</span>
           </div>
 
-          <!-- BIGGER LOG WINDOW -->
+          <!-- LOG WINDOW -->
           <div class="log-box" id="logBox"></div>
         </div>
       </div>
@@ -176,6 +173,6 @@
     <p>Speed Bot · Not financial advice · Trade at your own risk</p>
   </footer>
 
-  <script src="script.js?v=4.0"></script>
+  <script src="script.js?v=8.1"></script>
 </body>
 </html>
