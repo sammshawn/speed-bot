@@ -1,9 +1,6 @@
 // ============================================
-//  SPEED BOT — V8.1 (Direct-Buy Engine)
-//  - No proposals: trades are bought directly with `buy: 1` + `parameters`
-//  - One trade at a time, watchdog timers can never deadlock
-//  - Every API error is routed + logged, nothing fails silently
-//  - Digits are read with the market's pip_size (no lost trailing zeros)
+//  SPEED BOT — V8.2 (Reliable Proposal Engine)
+//  Fixes: Direct Buy rejection, Error logging
 // ============================================
 
 const CLIENT_ID = "34RaG6zRPpQYEeugvLnPq";
@@ -15,18 +12,16 @@ const API_BASE = "https://api.derivws.com/trading/v1/options";
 // ---- State ----
 let accessToken = null;
 let accounts = [];
-let activeAccount = null;      // { id, type, currency }
+let activeAccount = null;      
 let ws = null;
 let reqId = 1;
 let reconnectAttempts = 0;
 let reconnectTimer = null;
 
-let isExecuting = false;       // bot on/off
-let botState = "IDLE";         // IDLE | TRADING | HOOK | WAITING_RESULT | STOPPED
-let stateBeforeTrade = "TRADING";
-let tradeLock = false;         // true from buy request until contract settles
+let isExecuting = false;       
+let botState = "IDLE";         
+let tradeLock = false;         
 let currentContractId = null;
-let buyTimer = null;
 let resultTimer = null;
 let buyErrors = 0;
 
@@ -34,14 +29,11 @@ let hookTicksCount = 0;
 let currentMartingaleStep = 1;
 let wins = 0, losses = 0, totalTrades = 0;
 let totalPL = 0;
-let lastTick = { price: null, digit: null };
-let pocSeen = false;
 let currentStake = 0.35;
 let currentEntry = { price: null, digit: null };
-const settledIds = new Set();
-const learnedPip = {};         // symbol -> decimals seen
+let cachedProposal = null; // Stores { id, ask_price }
 
-// ---- DOM ----
+// DOM
 const $ = (id) => document.getElementById(id);
 const loginCard = $("loginCard");
 const botDashboard = $("botDashboard");
@@ -91,7 +83,6 @@ function stakeForStep(step) {
   return round2(getBase() * Math.pow(getMult(), step - 1));
 }
 
-// Last digit taken from a string so trailing zeros are never lost
 function lastDigit(str) {
   const m = String(str).match(/(\d)\D*$/);
   return m ? parseInt(m[1], 10) : 0;
@@ -99,10 +90,7 @@ function lastDigit(str) {
 function formatTick(tick) {
   const quote = Number(tick.quote);
   const decimals = (String(tick.quote).split(".")[1] || "").length;
-  const pip = Number.isInteger(tick.pip_size)
-    ? tick.pip_size
-    : (learnedPip[tick.symbol] = Math.max(learnedPip[tick.symbol] || 0, decimals));
-  return quote.toFixed(pip);
+  return quote.toFixed(decimals);
 }
 
 function checkWinCondition(digit) {
@@ -110,8 +98,6 @@ function checkWinCondition(digit) {
   switch (contractType.value) {
     case "DIGITOVER":  return digit > b;
     case "DIGITUNDER": return digit < b;
-    case "DIGITMATCH": return digit === b;
-    case "DIGITDIFF":  return digit !== b;
     case "DIGITEVEN":  return digit % 2 === 0;
     case "DIGITODD":   return digit % 2 === 1;
     default:           return true;
@@ -122,7 +108,6 @@ function checkWinCondition(digit) {
 function timeNow() {
   return new Date().toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
-// Show a price with its last digit (the digit Deriv trades on) highlighted
 function fixDecimals(p, ref) {
   const dec = (String(ref).split(".")[1] || "").length;
   const have = (String(p).split(".")[1] || "").length;
@@ -166,7 +151,6 @@ function logInfo(msg) {
   t.textContent = timeNow();
   const m = document.createElement("span");
   m.style.gridColumn = "2 / -1";
-  t.style.gridColumn = "1";
   m.textContent = msg;
   el.append(t, m);
   logBox.appendChild(el);
@@ -174,7 +158,7 @@ function logInfo(msg) {
 }
 clearLogBtn.addEventListener("click", () => { logBox.innerHTML = ""; });
 
-// ---- AUTH (PKCE) ----
+// ---- AUTH ----
 function generatePKCE() {
   const array = crypto.getRandomValues(new Uint8Array(64));
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
@@ -279,7 +263,7 @@ function closeSocket() {
   clearTimeout(reconnectTimer);
   if (ws) {
     const old = ws;
-    ws = null;                 // handlers ignore sockets that are no longer current
+    ws = null;                 
     try { old.close(); } catch (_) {}
   }
 }
@@ -302,8 +286,6 @@ async function connectWS() {
       reconnectAttempts = 0;
       send({ balance: 1, subscribe: 1 });
       subscribeTicks();
-      // Resume tracking a contract that was open when the connection dropped
-      if (currentContractId) send({ proposal_open_contract: 1, contract_id: currentContractId, subscribe: 1 });
       startBtn.disabled = isExecuting;
       logInfo("Connected. Ready.");
     };
@@ -312,31 +294,42 @@ async function connectWS() {
       if (socket !== ws) return;
       let msg;
       try { msg = JSON.parse(event.data); } catch (_) { return; }
-      if (msg.error) { handleError(msg); return; }
+      
+      if (msg.error) { 
+        // 🚨 FIX: Show the exact error in the log so we know why it fails
+        console.error("Deriv Error:", msg.error);
+        logInfo(`❌ API Error: ${msg.error.message} (${msg.error.code})`);
+        
+        // If the buy request failed, unlock the trade
+        if (msg.echo_req && msg.echo_req.buy) {
+           tradeLock = false;
+           if (isExecuting) botState = "TRADING";
+        }
+        return; 
+      }
 
       switch (msg.msg_type) {
         case "balance":
-          if (msg.balance) {
-            balanceEl.textContent = `$${parseFloat(msg.balance.balance).toFixed(2)}`;
-            if (msg.balance.currency && activeAccount) activeAccount.currency = msg.balance.currency;
-          }
+          if (msg.balance) balanceEl.textContent = `$${parseFloat(msg.balance.balance).toFixed(2)}`;
           break;
         case "tick":
           if (msg.tick) handleTick(msg.tick);
           break;
+        case "proposal":
+          if (msg.proposal) handleProposal(msg.proposal);
+          break;
         case "buy":
-          handleBuy(msg.buy);
+          if (msg.buy) handleBuy(msg.buy);
           break;
         case "proposal_open_contract":
-          if (msg.proposal_open_contract) handleContractUpdate(msg.proposal_open_contract, msg.subscription);
+          if (msg.proposal_open_contract) handleContractUpdate(msg.proposal_open_contract);
           break;
       }
     };
 
     socket.onerror = () => { if (socket === ws) logInfo("Socket error."); };
-
     socket.onclose = () => {
-      if (socket !== ws) return;     // deliberate close / old socket
+      if (socket !== ws) return;     
       ws = null;
       startBtn.disabled = true;
       scheduleReconnect();
@@ -371,30 +364,12 @@ marketSelect.addEventListener("change", () => {
   subscribeTicks();
 });
 
-// ---- ERRORS ----
-function handleError(msg) {
-  const err = msg.error;
-  const echo = msg.echo_req || {};
-  console.warn("Deriv error:", msg);
-  logInfo(`❌ ${err.code || "Error"}: ${err.message}`);
-
-  const isBuyError = echo.buy !== undefined || msg.msg_type === "buy";
-  if (isBuyError) {
-    clearTimeout(buyTimer);
-    tradeLock = false;
-    buyErrors++;
-    if (isExecuting) botState = stateBeforeTrade;
-    const fatal = ["InvalidToken", "AuthorizationRequired", "InsufficientBalance", "PermissionDenied"];
-    if (fatal.includes(err.code) || buyErrors >= 3) stopBot("Stopped after trade errors.");
-  }
-}
-
-// ---- ENGINE ----
+// ---- ENGINE (Proposal -> Buy Flow) ----
 function handleTick(tick) {
   if (tick.symbol && tick.symbol !== marketSelect.value) return;
   const priceStr = formatTick(tick);
   const digit = lastDigit(priceStr);
-  lastTick = { price: priceStr, digit };   // always tracked, even while idle
+  
   if (!isExecuting || tradeLock) return;
 
   if (botState === "HOOK") {
@@ -403,7 +378,7 @@ function handleTick(tick) {
       if (hookTicksCount >= 2) {
         logInfo("Hook fired. Recovering…");
         hookTicksCount = 0;
-        placeTrade(priceStr, digit);
+        triggerTrade(priceStr, digit);
       }
     } else {
       hookTicksCount = 0;
@@ -411,14 +386,32 @@ function handleTick(tick) {
     return;
   }
 
-  if (botState === "TRADING") placeTrade(priceStr, digit);
+  if (botState === "TRADING") triggerTrade(priceStr, digit);
 }
 
-function placeTrade(entryPrice, entryDigit) {
+function triggerTrade(entryPrice, entryDigit) {
   if (!isExecuting || tradeLock || !wsOpen()) return;
 
   currentStake = stakeForStep(currentMartingaleStep);
+  currentEntry = { price: entryPrice, digit: entryDigit };
+
+  // If we have a cached proposal, buy instantly
+  if (cachedProposal) {
+    executeBuy(cachedProposal.id, cachedProposal.ask_price);
+    cachedProposal = null;
+    // Pre-fetch the next one in the background
+    requestProposal();
+  } else {
+    // If no cache, ask for a proposal first
+    logInfo("Fetching proposal...");
+    requestProposal();
+  }
+}
+
+function requestProposal() {
+  if (!wsOpen() || !isExecuting) return;
   const params = {
+    proposal: 1,
     amount: currentStake,
     basis: "stake",
     contract_type: contractType.value,
@@ -428,79 +421,68 @@ function placeTrade(entryPrice, entryDigit) {
     underlying_symbol: marketSelect.value,
   };
   if (NEEDS_BARRIER.includes(contractType.value)) params.barrier = String(getBarrier());
+  send(params);
+}
 
-  tradeLock = true;
-  stateBeforeTrade = botState;
-  botState = "WAITING_RESULT";
-  currentEntry = { price: entryPrice, digit: entryDigit };
-  updateMartingaleUI();
-
-  const ok = send({ buy: 1, price: currentStake, parameters: params, subscribe: 1 });
-  if (!ok) {
-    tradeLock = false;
-    botState = stateBeforeTrade;
+function handleProposal(proposal) {
+  // If we are currently waiting (tradeLock is true), cache this proposal for the next trade
+  if (tradeLock) {
+    cachedProposal = { id: proposal.id, ask_price: proposal.ask_price };
     return;
   }
 
-  clearTimeout(buyTimer);
-  buyTimer = setTimeout(() => {
+  // If we aren't locked, it means a tick triggered and we needed a proposal NOW.
+  // Buy it immediately.
+  executeBuy(proposal.id, proposal.ask_price);
+  // Pre-fetch the next one
+  requestProposal();
+}
+
+function executeBuy(proposalId, price) {
+  tradeLock = true;
+  botState = "WAITING_RESULT";
+  
+  // Send the buy request
+  const ok = send({ buy: proposalId, price: price });
+  if (!ok) {
+    tradeLock = false;
+    botState = "TRADING";
+    return;
+  }
+
+  // Watchdog: if buy fails, unlock
+  clearTimeout(resultTimer);
+  resultTimer = setTimeout(() => {
     if (tradeLock && !currentContractId) {
-      logInfo("No response to buy request. Unlocking.");
+      logInfo("Buy request timed out. Unlocking.");
       tradeLock = false;
-      if (isExecuting) botState = stateBeforeTrade;
+      if (isExecuting) botState = "TRADING";
     }
-  }, 8000);
+  }, 5000);
 }
 
 function handleBuy(buy) {
   if (!buy) return;
-  clearTimeout(buyTimer);
+  clearTimeout(resultTimer);
   buyErrors = 0;
   totalTrades++;
   tradeCountEl.textContent = totalTrades;
   currentContractId = buy.contract_id;
   if (buy.balance_after !== undefined) balanceEl.textContent = `$${parseFloat(buy.balance_after).toFixed(2)}`;
 
-  pocSeen = false;
-  const cid = buy.contract_id;
-  setTimeout(() => {
-    if (!pocSeen && tradeLock && currentContractId === cid) {
-      send({ proposal_open_contract: 1, contract_id: cid, subscribe: 1 });
-    }
-  }, 1500);
-  armResultTimer(1);
+  // Subscribe to contract result
+  send({ proposal_open_contract: 1, contract_id: buy.contract_id, subscribe: 1 });
 }
 
-// If the result never arrives: re-ask once, then unlock
-function armResultTimer(stage) {
-  clearTimeout(resultTimer);
-  resultTimer = setTimeout(() => {
-    if (!tradeLock || !currentContractId) return;
-    if (stage === 1) {
-      logInfo("Waiting for result… re-checking contract.");
-      send({ proposal_open_contract: 1, contract_id: currentContractId, subscribe: 1 });
-      armResultTimer(2);
-    } else {
-      logInfo("Result timed out. Unlocking.");
-      tradeLock = false;
-      currentContractId = null;
-      if (isExecuting) botState = "TRADING";
-    }
-  }, 20000);
-}
-
-function handleContractUpdate(c, subscription) {
-  if (c.contract_id === currentContractId) pocSeen = true;
+function handleContractUpdate(c) {
   if (!c.is_sold) return;
   if (c.contract_id !== currentContractId) return;
-  if (settledIds.has(c.contract_id)) return;
-  settledIds.add(c.contract_id);
 
   clearTimeout(resultTimer);
-  if (subscription?.id) send({ forget: subscription.id });
+  send({ forget: c.id });
 
   const profit = parseFloat(c.profit);
-  const entryPrice = String(c.entry_spot_display_value || c.entry_tick_display_value || c.entry_spot || currentEntry.price);
+  const entryPrice = String(c.entry_spot_display_value || c.entry_tick_display_value || currentEntry.price);
   const exitPrice = fixDecimals(c.exit_tick_display_value || c.exit_tick || c.sell_spot_display_value || currentEntry.price, entryPrice);
   const entryDigit = lastDigit(entryPrice);
   const exitDigit = lastDigit(exitPrice);
@@ -523,7 +505,6 @@ function handleContractUpdate(c, subscription) {
       currentMartingaleStep = 1;
       tradeLock = false;
       currentContractId = null;
-      updateMartingaleUI();
       if (isExecuting) stopBot("Max martingale steps reached.");
       return;
     }
@@ -531,16 +512,17 @@ function handleContractUpdate(c, subscription) {
     if (isExecuting) {
       botState = "HOOK";
       hookTicksCount = 0;
-      logInfo("Hook active. Waiting for 2 winning digits in a row…");
+      logInfo("Hook active. Waiting for 2 winning digits…");
     }
   }
 
   tradeLock = false;
   currentContractId = null;
-  updateMartingaleUI();
-
-  // Speed: in TRADING mode fire the next trade right now instead of waiting for another tick
-  if (isExecuting && botState === "TRADING") placeTrade(lastTick.price, lastTick.digit);
+  
+  // If we are back to TRADING, immediately request the next proposal to be ready
+  if (isExecuting && botState === "TRADING") {
+    requestProposal();
+  }
 }
 
 function updateMartingaleUI() {
@@ -555,18 +537,13 @@ startBtn.addEventListener("click", () => {
 
   const base = getBase();
   if (!(base >= 0.35)) { logInfo("Stake must be at least 0.35."); return; }
-  if (NEEDS_BARRIER.includes(contractType.value)) {
-    const b = getBarrier();
-    if (!(b >= 0 && b <= 9)) { logInfo("Barrier must be a digit 0–9."); return; }
-    if (contractType.value === "DIGITOVER" && b === 9) { logInfo("Over 9 can never win. Pick a lower barrier."); return; }
-    if (contractType.value === "DIGITUNDER" && b === 0) { logInfo("Under 0 can never win. Pick a higher barrier."); return; }
-  }
 
   currentMartingaleStep = 1;
   buyErrors = 0;
   hookTicksCount = 0;
   tradeLock = false;
   currentContractId = null;
+  cachedProposal = null;
   isExecuting = true;
   botState = "TRADING";
   marketSelect.disabled = true;
@@ -574,7 +551,10 @@ startBtn.addEventListener("click", () => {
   startBtn.disabled = true;
   stopBtn.disabled = false;
   updateMartingaleUI();
-  logInfo(`Bot started: ${contractType.value} on ${marketSelect.value}, base stake $${base.toFixed(2)}.`);
+  logInfo(`Bot started: ${contractType.value} on ${marketSelect.value}, base $${base.toFixed(2)}.`);
+  
+  // Pre-fetch the first proposal
+  requestProposal();
 });
 
 stopBtn.addEventListener("click", () => stopBot("Bot stopped."));
@@ -583,13 +563,14 @@ function stopBot(reason) {
   isExecuting = false;
   botState = "STOPPED";
   hookTicksCount = 0;
-  clearTimeout(buyTimer);
+  tradeLock = false;
+  cachedProposal = null;
+  clearTimeout(resultTimer);
   marketSelect.disabled = false;
   contractType.disabled = false;
   startBtn.disabled = !wsOpen();
   stopBtn.disabled = true;
   logInfo(reason || "Bot stopped.");
-  // If a contract is still open, its result will still be logged when it settles.
 }
 
 logoutBtn.addEventListener("click", () => {
@@ -599,8 +580,6 @@ logoutBtn.addEventListener("click", () => {
   accessToken = null;
   accounts = [];
   activeAccount = null;
-  tradeLock = false;
-  currentContractId = null;
   loginCard.style.display = "block";
   botDashboard.classList.remove("show");
   accountSwitcher.style.display = "none";
