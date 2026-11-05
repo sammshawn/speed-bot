@@ -131,7 +131,10 @@
         </div>
 
         <div class="panel status-panel">
-          <h2>Trade History</h2>
+          <div class="status-header-row">
+            <h2>Trade History</h2>
+            <button class="btn-clear-log" id="clearLogBtn">Reset Log</button>
+          </div>
 
           <div class="status-grid">
             <div class="stat">
@@ -147,12 +150,21 @@
               <div class="stat-value loss" id="losses">0</div>
             </div>
             <div class="stat">
-              <div class="stat-label">Bot State</div>
-              <div class="stat-value" id="botState" style="font-size: 0.9rem; color: var(--amber);">IDLE</div>
+              <div class="stat-label">Total P/L</div>
+              <div class="stat-value" id="totalPL">$0.00</div>
             </div>
           </div>
 
-          <!-- CLEAN LOG WINDOW -->
+          <!-- LOG HEADERS -->
+          <div class="log-headers">
+            <span>Time</span>
+            <span>Entry</span>
+            <span>Exit</span>
+            <span>Stake</span>
+            <span>P/L</span>
+          </div>
+
+          <!-- BIGGER LOG WINDOW -->
           <div class="log-box" id="logBox"></div>
         </div>
       </div>
@@ -164,7 +176,6 @@
     <p>Speed Bot · Not financial advice · Trade at your own risk</p>
   </footer>
 
-  <!-- CACHE BUSTER -->
-  <script src="script.js?v=3.0"></script>
+  <script src="script.js?v=4.0"></script>
 </body>
 </html>
