@@ -1,6 +1,5 @@
 // ============================================
-//  SPEED BOT — V9.0 (Official Flow + Error Logging)
-//  Fixes: Buy rejection, Silent errors
+//  SPEED BOT — V10.0 (Stable Connection + Correct Prices)
 // ============================================
 
 const CLIENT_ID = "34RaG6zRPpQYEeugvLnPq";
@@ -17,6 +16,7 @@ let ws = null;
 let reqId = 1;
 let reconnectAttempts = 0;
 let reconnectTimer = null;
+let pingInterval = null; // 🚨 Heartbeat timer
 
 let isExecuting = false;       
 let botState = "IDLE";         
@@ -30,7 +30,7 @@ let wins = 0, losses = 0, totalTrades = 0;
 let totalPL = 0;
 let currentStake = 0.35;
 let currentEntry = { price: null, digit: null };
-let cachedProposal = null; // Stores { id, ask_price }
+let cachedProposal = null;
 
 // DOM
 const $ = (id) => document.getElementById(id);
@@ -103,11 +103,28 @@ function checkWinCondition(digit) {
   }
 }
 
+// ---- 🚨 PRICE EXTRACTION FIX ----
+function extractPrice(contract, isEntry) {
+  if (!contract) return null;
+  // Try every possible field Deriv uses
+  const fields = isEntry 
+    ? ["entry_spot_display_value", "entry_tick_display_value", "entry_spot", "entry_tick"]
+    : ["exit_tick_display_value", "exit_tick", "sell_spot_display_value", "sell_spot", "sell_price"];
+  
+  for (const field of fields) {
+    if (contract[field] !== undefined && contract[field] !== null) {
+      return String(contract[field]);
+    }
+  }
+  return null;
+}
+
 // ---- Logging ----
 function timeNow() {
   return new Date().toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 function priceHtml(price, digitClass) {
+  if (!price) return `<span class="px">—</span>`;
   const s = String(price);
   return `<span class="px">${s.slice(0, -1)}<span class="${digitClass} px-digit">${s.slice(-1)}</span></span>`;
 }
@@ -252,9 +269,10 @@ pillReal.addEventListener("click", () => {
   if (a) selectAccount(a);
 });
 
-// ---- WEBSOCKET ----
+// ---- WEBSOCKET (With Heartbeat) ----
 function closeSocket() {
   clearTimeout(reconnectTimer);
+  clearInterval(pingInterval);
   if (ws) {
     const old = ws;
     ws = null;                 
@@ -282,6 +300,12 @@ async function connectWS() {
       subscribeTicks();
       startBtn.disabled = isExecuting;
       logInfo("Connected. Ready.");
+      
+      // 🚨 HEARTBEAT: Ping every 20 seconds to keep the connection alive
+      clearInterval(pingInterval);
+      pingInterval = setInterval(() => {
+        if (wsOpen()) send({ ping: 1 });
+      }, 20000);
     };
 
     socket.onmessage = (event) => {
@@ -290,11 +314,8 @@ async function connectWS() {
       try { msg = JSON.parse(event.data); } catch (_) { return; }
       
       if (msg.error) { 
-        // 🚨 LOG THE EXACT ERROR
         console.error("Deriv Error:", msg.error);
         logInfo(`❌ API Error: ${msg.error.message} (${msg.error.code})`);
-        
-        // If the buy request failed, unlock the trade
         if (msg.echo_req && (msg.echo_req.buy || msg.echo_req.proposal)) {
            tradeLock = false;
            if (isExecuting) botState = "TRADING";
@@ -325,6 +346,7 @@ async function connectWS() {
     socket.onclose = () => {
       if (socket !== ws) return;     
       ws = null;
+      clearInterval(pingInterval);
       startBtn.disabled = true;
       scheduleReconnect();
     };
@@ -358,7 +380,7 @@ marketSelect.addEventListener("change", () => {
   subscribeTicks();
 });
 
-// ---- ENGINE (Proposal -> Buy Flow) ----
+// ---- ENGINE ----
 function handleTick(tick) {
   if (tick.symbol && tick.symbol !== marketSelect.value) return;
   const priceStr = formatTick(tick);
@@ -392,7 +414,7 @@ function triggerTrade(entryPrice, entryDigit) {
   if (cachedProposal) {
     executeBuy(cachedProposal.id, cachedProposal.ask_price);
     cachedProposal = null;
-    requestProposal(); // Pre-fetch next
+    requestProposal();
   } else {
     logInfo("Fetching proposal...");
     requestProposal();
@@ -416,22 +438,18 @@ function requestProposal() {
 }
 
 function handleProposal(proposal) {
-  // If we are locked (waiting for result), cache this proposal for the next trade
   if (tradeLock) {
     cachedProposal = { id: proposal.id, ask_price: proposal.ask_price };
     return;
   }
-
-  // If not locked, a tick triggered this request. Buy immediately.
   executeBuy(proposal.id, proposal.ask_price);
-  requestProposal(); // Pre-fetch next
+  requestProposal();
 }
 
 function executeBuy(proposalId, price) {
   tradeLock = true;
   botState = "WAITING_RESULT";
   
-  // 🚨 OFFICIAL BUY FORMAT: buy = proposalId, price = ask_price
   const ok = send({ buy: proposalId, price: price });
   if (!ok) {
     tradeLock = false;
@@ -460,6 +478,7 @@ function handleBuy(buy) {
   send({ proposal_open_contract: 1, contract_id: buy.contract_id, subscribe: 1 });
 }
 
+// 🚨 CONTRACT UPDATE WITH SAFE PRICE EXTRACTION
 function handleContractUpdate(c) {
   if (!c.is_sold) return;
   if (c.contract_id !== currentContractId) return;
@@ -467,13 +486,16 @@ function handleContractUpdate(c) {
   clearTimeout(resultTimer);
   send({ forget: c.id });
 
-  const profit = parseFloat(c.profit);
-  const entryPrice = String(c.entry_spot_display_value || c.entry_tick_display_value || currentEntry.price);
-  const exitPrice = String(c.exit_tick_display_value || c.exit_tick || c.sell_spot_display_value || currentEntry.price);
+  const profit = parseFloat(c.profit) || 0;
+  
+  // Extract prices safely
+  const entryPrice = extractPrice(c, true) || currentEntry.price || "0.00";
+  const exitPrice = extractPrice(c, false) || currentEntry.price || "0.00";
+  
   const entryDigit = lastDigit(entryPrice);
   const exitDigit = lastDigit(exitPrice);
 
-  totalPL += Number.isFinite(profit) ? profit : 0;
+  totalPL += profit;
   updateTotalPL();
 
   if (profit > 0) {
@@ -506,7 +528,7 @@ function handleContractUpdate(c) {
   currentContractId = null;
   
   if (isExecuting && botState === "TRADING") {
-    requestProposal(); // Pre-fetch next
+    requestProposal();
   }
 }
 
