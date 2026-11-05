@@ -1,6 +1,9 @@
 // ============================================
-//  SPEED BOT — V7.0 (Queue Engine)
-//  Fixes: Proposals, Race Conditions, Freezing
+//  SPEED BOT — V8.0 (Direct-Buy Engine)
+//  - No proposals: trades are bought directly with `buy: 1` + `parameters`
+//  - One trade at a time, watchdog timers can never deadlock
+//  - Every API error is routed + logged, nothing fails silently
+//  - Digits are read with the market's pip_size (no lost trailing zeros)
 // ============================================
 
 const CLIENT_ID = "34RaG6zRPpQYEeugvLnPq";
@@ -9,466 +12,588 @@ const AUTH_URL = "https://auth.deriv.com/oauth2/auth";
 const TOKEN_URL = "https://auth.deriv.com/oauth2/token";
 const API_BASE = "https://api.derivws.com/trading/v1/options";
 
+// ---- State ----
 let accessToken = null;
 let accounts = [];
-let activeAccount = null;
+let activeAccount = null;      // { id, type, currency }
 let ws = null;
 let reqId = 1;
-
-// Session Management
-let sessionId = 0; 
 let reconnectAttempts = 0;
+let reconnectTimer = null;
 
-// Engine State
-let isExecuting = false; 
-let botState = "IDLE"; // IDLE, TRADING, HOOK, WAITING_RESULT
+let isExecuting = false;       // bot on/off
+let botState = "IDLE";         // IDLE | TRADING | HOOK | WAITING_RESULT | STOPPED
+let stateBeforeTrade = "TRADING";
+let tradeLock = false;         // true from buy request until contract settles
+let currentContractId = null;
+let buyTimer = null;
+let resultTimer = null;
+let buyErrors = 0;
+
 let hookTicksCount = 0;
 let currentMartingaleStep = 1;
 let wins = 0, losses = 0, totalTrades = 0;
-let baseStake = 0.35;
+let currentStake = 0.35;
+let currentEntry = { price: null, digit: null };
+const settledIds = new Set();
+const learnedPip = {};         // symbol -> decimals seen
 
-// Mutex & Queue
-let isTradeActive = false; 
-let isProposalPending = false;
-let safetyTimeout = null; 
+// ---- DOM ----
+const $ = (id) => document.getElementById(id);
+const loginCard = $("loginCard");
+const botDashboard = $("botDashboard");
+const loginBtn = $("loginBtn");
+const logoutBtn = $("logoutBtn");
+const authText = $("authText");
+const authDot = $("authDot");
+const accountSwitcher = $("accountSwitcher");
+const pillDemo = $("pillDemo");
+const pillReal = $("pillReal");
+const demoAccId = $("demoAccId");
+const realAccId = $("realAccId");
+const activeAccLabel = $("activeAccLabel");
+const balanceEl = $("balance");
+const tradeCountEl = $("tradeCount");
+const winsEl = $("wins");
+const lossesEl = $("losses");
+const logBox = $("logBox");
+const clearLogBtn = $("clearLogBtn");
+const startBtn = $("startBtn");
+const stopBtn = $("stopBtn");
+const mbStatus = $("mbStatus");
+const marketSelect = $("marketSelect");
+const contractType = $("contractType");
+const barrierInput = $("barrier");
+const stakeInput = $("stake");
+const martingaleMultiplier = $("martingaleMultiplier");
+const martingaleMaxSteps = $("martingaleMaxSteps");
 
-// Proposal & Tick Queue
-let activeProposal = null; 
-let queuedTick = null; // 🚨 Holds a tick if we are waiting for a proposal
-let currentEntryPrice = null;
-let currentEntryDigit = null;
+// ---- Helpers ----
+const wsOpen = () => ws && ws.readyState === WebSocket.OPEN;
+function send(obj) {
+  if (!wsOpen()) return false;
+  obj.req_id = reqId++;
+  ws.send(JSON.stringify(obj));
+  return true;
+}
+const NEEDS_BARRIER = ["DIGITOVER", "DIGITUNDER", "DIGITMATCH", "DIGITDIFF"];
+const round2 = (n) => Math.round(n * 100) / 100;
+const getBase = () => parseFloat(stakeInput.value);
+const getMult = () => parseFloat(martingaleMultiplier.value) || 2;
+const getMaxSteps = () => parseInt(martingaleMaxSteps.value, 10) || 1;
+const getBarrier = () => parseInt(barrierInput.value, 10);
 
-// DOM Elements
-const loginCard = document.getElementById("loginCard");
-const botDashboard = document.getElementById("botDashboard");
-const loginBtn = document.getElementById("loginBtn");
-const logoutBtn = document.getElementById("logoutBtn");
-const authText = document.getElementById("authText");
-const authDot = document.getElementById("authDot");
-const accountSwitcher = document.getElementById("accountSwitcher");
-const pillDemo = document.getElementById("pillDemo");
-const pillReal = document.getElementById("pillReal");
-const demoAccId = document.getElementById("demoAccId");
-const realAccId = document.getElementById("realAccId");
-const activeAccLabel = document.getElementById("activeAccLabel");
-const balanceEl = document.getElementById("balance");
-const tradeCountEl = document.getElementById("tradeCount");
-const winsEl = document.getElementById("wins");
-const lossesEl = document.getElementById("losses");
-const logBox = document.getElementById("logBox");
-const clearLogBtn = document.getElementById("clearLogBtn");
-const startBtn = document.getElementById("startBtn");
-const stopBtn = document.getElementById("stopBtn");
-const mbStatus = document.getElementById("mbStatus");
-const marketSelect = document.getElementById("marketSelect");
-const contractType = document.getElementById("contractType");
-const barrierInput = document.getElementById("barrier");
-const stakeInput = document.getElementById("stake");
-const martingaleMultiplier = document.getElementById("martingaleMultiplier");
-const martingaleMaxSteps = document.getElementById("martingaleMaxSteps");
-
-// ---- DYNAMIC DECIMAL PARSER ----
-function getLastDigit(quote) {
-  const str = quote.toString();
-  const parts = str.split('.');
-  if (parts.length === 2 && parts[1].length > 0) {
-    return parseInt(parts[1].slice(-1), 10);
-  }
-  return parseInt(str.slice(-1), 10);
+function stakeForStep(step) {
+  return round2(getBase() * Math.pow(getMult(), step - 1));
 }
 
-// ---- LOGGING ----
+// Last digit taken from a string so trailing zeros are never lost
+function lastDigit(str) {
+  const m = String(str).match(/(\d)\D*$/);
+  return m ? parseInt(m[1], 10) : 0;
+}
+function formatTick(tick) {
+  const quote = Number(tick.quote);
+  const decimals = (String(tick.quote).split(".")[1] || "").length;
+  const pip = Number.isInteger(tick.pip_size)
+    ? tick.pip_size
+    : (learnedPip[tick.symbol] = Math.max(learnedPip[tick.symbol] || 0, decimals));
+  return quote.toFixed(pip);
+}
+
+function checkWinCondition(digit) {
+  const b = getBarrier();
+  switch (contractType.value) {
+    case "DIGITOVER":  return digit > b;
+    case "DIGITUNDER": return digit < b;
+    case "DIGITMATCH": return digit === b;
+    case "DIGITDIFF":  return digit !== b;
+    case "DIGITEVEN":  return digit % 2 === 0;
+    case "DIGITODD":   return digit % 2 === 1;
+    default:           return true;
+  }
+}
+
+// ---- Logging ----
+function timeNow() {
+  return new Date().toLocaleTimeString([], { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
 function logTrade(type, entryPrice, entryDigit, exitPrice, exitDigit, stake, pl) {
-  const entryEl = document.createElement("div");
-  entryEl.className = `log-entry ${type}`;
-  const time = new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute:'2-digit', second:'2-digit' });
-  
+  const el = document.createElement("div");
+  el.className = `log-entry ${type}`;
   const plText = pl >= 0 ? `+$${pl.toFixed(2)}` : `-$${Math.abs(pl).toFixed(2)}`;
   const plClass = pl >= 0 ? "pl-positive" : "pl-negative";
   const digitClass = type === "win" ? "digit-green" : "digit-red";
-
-  entryEl.innerHTML = `
-    <span class="log-time">${time}</span>
-    <span>Entry: <span class="${digitClass}">${entryDigit}</span> @ ${parseFloat(entryPrice).toFixed(2)}</span>
-    <span>Exit: <span class="${digitClass}">${exitDigit}</span> @ ${parseFloat(exitPrice).toFixed(2)}</span>
-    <span class="${plClass}">${plText} ($${stake})</span>
-  `;
-  logBox.appendChild(entryEl);
+  el.innerHTML = `
+    <span class="log-time">${timeNow()}</span>
+    <span>Entry: <span class="${digitClass}">${entryDigit}</span> @ ${entryPrice}</span>
+    <span>Exit: <span class="${digitClass}">${exitDigit}</span> @ ${exitPrice}</span>
+    <span class="${plClass}">${plText} ($${Number(stake).toFixed(2)})</span>`;
+  logBox.appendChild(el);
   logBox.scrollTop = logBox.scrollHeight;
 }
-
 function logInfo(msg) {
-  const entryEl = document.createElement("div");
-  entryEl.className = `log-entry info`;
-  entryEl.innerHTML = `<span class="log-time">${new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute:'2-digit', second:'2-digit' })}</span><span style="grid-column: span 3;">${msg}</span>`;
-  logBox.appendChild(entryEl);
+  const el = document.createElement("div");
+  el.className = "log-entry info";
+  const t = document.createElement("span");
+  t.className = "log-time";
+  t.textContent = timeNow();
+  const m = document.createElement("span");
+  m.style.gridColumn = "span 3";
+  m.textContent = msg;
+  el.append(t, m);
+  logBox.appendChild(el);
   logBox.scrollTop = logBox.scrollHeight;
 }
-
 clearLogBtn.addEventListener("click", () => { logBox.innerHTML = ""; });
 
-// ---- AUTH PKCE ----
+// ---- AUTH (PKCE) ----
 function generatePKCE() {
   const array = crypto.getRandomValues(new Uint8Array(64));
-  const codeVerifier = Array.from(array).map(v => 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~'[v % 66]).join('');
-  const state = crypto.getRandomValues(new Uint8Array(16)).reduce((s, b) => s + b.toString(16).padStart(2, '0'), '');
-  sessionStorage.setItem('pkce_code_verifier', codeVerifier);
-  sessionStorage.setItem('oauth_state', state);
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+  const codeVerifier = Array.from(array).map((v) => chars[v % chars.length]).join("");
+  const state = Array.from(crypto.getRandomValues(new Uint8Array(16))).map((b) => b.toString(16).padStart(2, "0")).join("");
+  sessionStorage.setItem("pkce_code_verifier", codeVerifier);
+  sessionStorage.setItem("oauth_state", state);
   return { codeVerifier, state };
 }
 async function generateCodeChallenge(verifier) {
-  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
-  return btoa(String.fromCharCode(...new Uint8Array(hash))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  return btoa(String.fromCharCode(...new Uint8Array(hash))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 async function startLogin() {
-  loginBtn.disabled = true; loginBtn.textContent = "Redirecting…";
+  loginBtn.disabled = true;
+  loginBtn.textContent = "Redirecting…";
   const { codeVerifier, state } = generatePKCE();
   const codeChallenge = await generateCodeChallenge(codeVerifier);
-  const params = new URLSearchParams({ response_type: "code", client_id: CLIENT_ID, redirect_uri: REDIRECT_URI, scope: "trade", state: state, code_challenge: codeChallenge, code_challenge_method: "S256" });
+  const params = new URLSearchParams({
+    response_type: "code", client_id: CLIENT_ID, redirect_uri: REDIRECT_URI,
+    scope: "trade", state, code_challenge: codeChallenge, code_challenge_method: "S256",
+  });
   window.location.href = `${AUTH_URL}?${params.toString()}`;
 }
 async function handleCallback() {
   const urlParams = new URLSearchParams(window.location.search);
-  const code = urlParams.get('code');
-  const state = urlParams.get('state');
+  const code = urlParams.get("code");
+  const state = urlParams.get("state");
   if (!code || !state) return false;
-  if (state !== sessionStorage.getItem('oauth_state')) { logInfo("State mismatch."); return false; }
-  const codeVerifier = sessionStorage.getItem('pkce_code_verifier');
-  if (!codeVerifier) { logInfo("PKCE missing."); return false; }
+  if (state !== sessionStorage.getItem("oauth_state")) { logInfo("State mismatch."); return false; }
+  const codeVerifier = sessionStorage.getItem("pkce_code_verifier");
+  if (!codeVerifier) { logInfo("PKCE verifier missing."); return false; }
   try {
     const response = await fetch(TOKEN_URL, {
-      method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({ grant_type: "authorization_code", client_id: CLIENT_ID, code, redirect_uri: REDIRECT_URI, code_verifier: codeVerifier }),
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code", client_id: CLIENT_ID, code,
+        redirect_uri: REDIRECT_URI, code_verifier: codeVerifier,
+      }),
     });
     const data = await response.json();
     if (!response.ok) { logInfo(`Token error: ${data.error_description || data.error}`); return false; }
     accessToken = data.access_token;
-    sessionStorage.setItem('deriv_access_token', accessToken);
-    sessionStorage.removeItem('pkce_code_verifier');
-    sessionStorage.removeItem('oauth_state');
+    sessionStorage.setItem("deriv_access_token", accessToken);
+    sessionStorage.removeItem("pkce_code_verifier");
+    sessionStorage.removeItem("oauth_state");
     window.history.replaceState({}, document.title, window.location.pathname);
     return true;
   } catch (err) { logInfo(`Network error: ${err.message}`); return false; }
 }
 
-// ---- FETCH ACCOUNTS ----
+// ---- ACCOUNTS ----
 async function fetchAccounts() {
   try {
-    const res = await fetch(`${API_BASE}/accounts`, { headers: { "Authorization": `Bearer ${accessToken}` } });
+    const res = await fetch(`${API_BASE}/accounts`, { headers: { Authorization: `Bearer ${accessToken}` } });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error?.message || "Failed");
+    if (!res.ok) {
+      if (res.status === 401) sessionStorage.removeItem("deriv_access_token");
+      throw new Error(data.error?.message || `HTTP ${res.status}`);
+    }
     accounts = data.data || [];
-    const demo = accounts.find(a => a.type === "demo" || a.account_type === "demo");
-    const real = accounts.find(a => a.type === "real" || a.account_type === "real");
+    const demo = accounts.find((a) => (a.type || a.account_type) === "demo");
+    const real = accounts.find((a) => (a.type || a.account_type) === "real");
     if (demo) demoAccId.textContent = demo.account_id;
     if (real) realAccId.textContent = real.account_id;
+    accountSwitcher.style.display = "flex";
     if (demo) selectAccount(demo);
     else if (real) selectAccount(real);
-    accountSwitcher.style.display = "flex";
+    else throw new Error("No demo or real account found");
     return true;
   } catch (err) { logInfo(`Account fetch failed: ${err.message}`); return false; }
 }
 
 async function selectAccount(acc) {
-  activeAccount = { id: acc.account_id, type: acc.type || acc.account_type };
+  if (isExecuting) stopBot("Account switched.");
+  activeAccount = {
+    id: acc.account_id,
+    type: acc.type || acc.account_type,
+    currency: acc.currency || "USD",
+  };
   pillDemo.classList.toggle("active", activeAccount.type === "demo");
   pillReal.classList.toggle("active", activeAccount.type === "real");
   activeAccLabel.textContent = `${activeAccount.type.toUpperCase()} (${activeAccount.id})`;
   balanceEl.textContent = "Connecting...";
-  if (ws) { ws.close(); ws = null; }
+  startBtn.disabled = true;
+  closeSocket();
+  reconnectAttempts = 0;
   await connectWS();
 }
-
 pillDemo.addEventListener("click", () => {
-  const demo = accounts.find(a => a.type === "demo" || a.account_type === "demo");
-  if (demo) selectAccount(demo);
+  const a = accounts.find((x) => (x.type || x.account_type) === "demo");
+  if (a) selectAccount(a);
 });
 pillReal.addEventListener("click", () => {
-  const real = accounts.find(a => a.type === "real" || a.account_type === "real");
-  if (real) selectAccount(real);
+  const a = accounts.find((x) => (x.type || x.account_type) === "real");
+  if (a) selectAccount(a);
 });
 
-// ---- WEBSOCKET & RECONNECT ----
+// ---- WEBSOCKET ----
+function closeSocket() {
+  clearTimeout(reconnectTimer);
+  if (ws) {
+    const old = ws;
+    ws = null;                 // handlers ignore sockets that are no longer current
+    try { old.close(); } catch (_) {}
+  }
+}
+
 async function connectWS() {
+  if (!accessToken || !activeAccount) return;
   try {
-    const res = await fetch(`${API_BASE}/accounts/${activeAccount.id}/otp`, { method: "POST", headers: { "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" } });
+    const res = await fetch(`${API_BASE}/accounts/${activeAccount.id}/otp`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+    });
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error?.message || "OTP failed");
-    
-    ws = new WebSocket(data.data.url);
-    ws.onopen = () => {
+    if (!res.ok) throw new Error(data.error?.message || `OTP failed (HTTP ${res.status})`);
+
+    const socket = new WebSocket(data.data.url);
+    ws = socket;
+
+    socket.onopen = () => {
+      if (socket !== ws) return;
       reconnectAttempts = 0;
-      ws.send(JSON.stringify({ balance: 1, subscribe: 1, req_id: reqId++ }));
+      send({ balance: 1, subscribe: 1 });
       subscribeTicks();
-      startBtn.disabled = false;
-      logInfo("Account ready. Connection established.");
+      // Resume tracking a contract that was open when the connection dropped
+      if (currentContractId) send({ proposal_open_contract: 1, contract_id: currentContractId, subscribe: 1 });
+      startBtn.disabled = isExecuting;
+      logInfo("Connected. Ready.");
     };
 
-    ws.onmessage = (event) => {
-      const msg = JSON.parse(event.data);
-      if (msg.error) { logInfo(`WS Error: ${msg.error.message}`); return; }
-      
-      if (msg.msg_type === "balance") balanceEl.textContent = `$${parseFloat(msg.balance.balance).toFixed(2)}`;
-      
-      if (!isExecuting) return;
+    socket.onmessage = (event) => {
+      if (socket !== ws) return;
+      let msg;
+      try { msg = JSON.parse(event.data); } catch (_) { return; }
+      if (msg.error) { handleError(msg); return; }
 
-      if (msg.msg_type === "tick") handleTick(msg.tick);
-      if (msg.msg_type === "proposal") handleProposal(msg.proposal);
-      if (msg.msg_type === "buy") handleBuy(msg.buy);
-      if (msg.msg_type === "proposal_open_contract") handleContractUpdate(msg.proposal_open_contract);
-    };
-
-    ws.onclose = () => { 
-      logInfo("Connection dropped. Reconnecting..."); 
-      startBtn.disabled = true; 
-      if (isExecuting && reconnectAttempts < 5) {
-        reconnectAttempts++;
-        const delay = Math.pow(2, reconnectAttempts) * 1000;
-        setTimeout(connectWS, delay);
-      } else {
-        stopBot();
+      switch (msg.msg_type) {
+        case "balance":
+          if (msg.balance) {
+            balanceEl.textContent = `$${parseFloat(msg.balance.balance).toFixed(2)}`;
+            if (msg.balance.currency && activeAccount) activeAccount.currency = msg.balance.currency;
+          }
+          break;
+        case "tick":
+          if (msg.tick) handleTick(msg.tick);
+          break;
+        case "buy":
+          handleBuy(msg.buy);
+          break;
+        case "proposal_open_contract":
+          if (msg.proposal_open_contract) handleContractUpdate(msg.proposal_open_contract, msg.subscription);
+          break;
       }
     };
-  } catch (err) { logInfo(`Connection failed: ${err.message}`); }
+
+    socket.onerror = () => { if (socket === ws) logInfo("Socket error."); };
+
+    socket.onclose = () => {
+      if (socket !== ws) return;     // deliberate close / old socket
+      ws = null;
+      startBtn.disabled = true;
+      scheduleReconnect();
+    };
+  } catch (err) {
+    logInfo(`Connection failed: ${err.message}`);
+    scheduleReconnect();
+  }
+}
+
+function scheduleReconnect() {
+  if (!accessToken || !activeAccount) return;
+  if (reconnectAttempts >= 6) {
+    logInfo("Could not reconnect. Refresh the page.");
+    if (isExecuting) stopBot("Connection lost.");
+    return;
+  }
+  reconnectAttempts++;
+  const delay = Math.min(Math.pow(2, reconnectAttempts) * 500, 10000);
+  logInfo(`Connection dropped. Reconnecting in ${Math.round(delay / 1000)}s…`);
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(connectWS, delay);
 }
 
 function subscribeTicks() {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(JSON.stringify({ ticks: marketSelect.value, subscribe: 1, req_id: reqId++ }));
+  if (!wsOpen()) return;
+  send({ forget_all: "ticks" });
+  send({ ticks: marketSelect.value, subscribe: 1 });
+}
+marketSelect.addEventListener("change", () => {
+  if (isExecuting) return;
+  subscribeTicks();
+});
+
+// ---- ERRORS ----
+function handleError(msg) {
+  const err = msg.error;
+  const echo = msg.echo_req || {};
+  console.warn("Deriv error:", msg);
+  logInfo(`❌ ${err.code || "Error"}: ${err.message}`);
+
+  const isBuyError = echo.buy !== undefined || msg.msg_type === "buy";
+  if (isBuyError) {
+    clearTimeout(buyTimer);
+    tradeLock = false;
+    buyErrors++;
+    if (isExecuting) botState = stateBeforeTrade;
+    const fatal = ["InvalidToken", "AuthorizationRequired", "InsufficientBalance", "PermissionDenied"];
+    if (fatal.includes(err.code) || buyErrors >= 3) stopBot("Stopped after trade errors.");
+  }
 }
 
-// --- THE QUEUE ENGINE ---
+// ---- ENGINE ----
 function handleTick(tick) {
-  if (isTradeActive || botState === "WAITING_RESULT" || botState === "IDLE" || botState === "STOPPED") return;
+  if (tick.symbol && tick.symbol !== marketSelect.value) return;
+  if (!isExecuting || tradeLock) return;
 
-  // If we have a queued tick, ignore new ones until the queue is processed
-  if (queuedTick) return;
+  const priceStr = formatTick(tick);
+  const digit = lastDigit(priceStr);
 
   if (botState === "HOOK") {
-    const digit = getLastDigit(tick.quote);
-    const isWinCondition = checkWinCondition(digit);
-    
-    if (isWinCondition) {
+    if (checkWinCondition(digit)) {
       hookTicksCount++;
       if (hookTicksCount >= 2) {
-        logInfo(`Hook fired. Recovering...`);
-        queuedTick = { price: tick.quote, digit: digit };
-        tryProcessQueue();
+        logInfo("Hook fired. Recovering…");
+        hookTicksCount = 0;
+        placeTrade(priceStr, digit);
       }
     } else {
       hookTicksCount = 0;
     }
-    return; 
-  }
-
-  if (botState === "TRADING") {
-    queuedTick = { price: tick.quote, digit: getLastDigit(tick.quote) };
-    tryProcessQueue();
-  }
-}
-
-// 🚨 THE FIX: Process the tick as soon as the proposal is ready
-function tryProcessQueue() {
-  if (!queuedTick) return;
-
-  if (!activeProposal) {
-    // We have a tick, but no proposal. Ask for one.
-    fetchProposalInBackground();
     return;
   }
 
-  // We have both! Fire the trade.
-  isTradeActive = true; 
-  botState = "WAITING_RESULT";
-  currentEntryPrice = queuedTick.price;
-  currentEntryDigit = queuedTick.digit;
-  queuedTick = null; // Clear the queue
-
-  clearTimeout(safetyTimeout);
-  safetyTimeout = setTimeout(() => {
-    if (isTradeActive) {
-      logInfo("API Timeout. Unlocking.");
-      isTradeActive = false;
-      botState = "TRADING";
-    }
-  }, 4000);
-
-  ws.send(JSON.stringify({
-    buy: activeProposal.id,
-    price: activeProposal.ask_price,
-    req_id: reqId++
-  }));
-  
-  activeProposal = null;
+  if (botState === "TRADING") placeTrade(priceStr, digit);
 }
 
-function fetchProposalInBackground() {
-  if (!ws || ws.readyState !== WebSocket.OPEN || !isExecuting || isProposalPending) return;
-  
-  isProposalPending = true;
+function placeTrade(entryPrice, entryDigit) {
+  if (!isExecuting || tradeLock || !wsOpen()) return;
 
-  const req = {
-    proposal: 1, amount: stakeInput.value, basis: "stake",
-    contract_type: contractType.value, currency: "USD", duration: 1, duration_unit: "t",
-    underlying_symbol: marketSelect.value, req_id: reqId++
+  currentStake = stakeForStep(currentMartingaleStep);
+  const params = {
+    amount: currentStake,
+    basis: "stake",
+    contract_type: contractType.value,
+    currency: activeAccount?.currency || "USD",
+    duration: 1,
+    duration_unit: "t",
+    underlying_symbol: marketSelect.value,
   };
-  if (contractType.value === "DIGITOVER" || contractType.value === "DIGITUNDER") {
-    req.barrier = barrierInput.value;
-  }
-  ws.send(JSON.stringify(req));
-}
+  if (NEEDS_BARRIER.includes(contractType.value)) params.barrier = String(getBarrier());
 
-function handleProposal(proposal) {
-  isProposalPending = false;
-  activeProposal = { id: proposal.id, ask_price: proposal.ask_price };
-  
-  // If a tick is waiting in the queue, fire it now!
-  if (queuedTick) {
-    tryProcessQueue();
+  tradeLock = true;
+  stateBeforeTrade = botState;
+  botState = "WAITING_RESULT";
+  currentEntry = { price: entryPrice, digit: entryDigit };
+  updateMartingaleUI();
+
+  const ok = send({ buy: 1, price: currentStake, parameters: params });
+  if (!ok) {
+    tradeLock = false;
+    botState = stateBeforeTrade;
+    return;
   }
+
+  clearTimeout(buyTimer);
+  buyTimer = setTimeout(() => {
+    if (tradeLock && !currentContractId) {
+      logInfo("No response to buy request. Unlocking.");
+      tradeLock = false;
+      if (isExecuting) botState = stateBeforeTrade;
+    }
+  }, 8000);
 }
 
 function handleBuy(buy) {
+  if (!buy) return;
+  clearTimeout(buyTimer);
+  buyErrors = 0;
   totalTrades++;
   tradeCountEl.textContent = totalTrades;
-  
-  ws.send(JSON.stringify({
-    proposal_open_contract: 1,
-    contract_id: buy.contract_id,
-    subscribe: 1,
-    req_id: reqId++
-  }));
+  currentContractId = buy.contract_id;
+  if (buy.balance_after !== undefined) balanceEl.textContent = `$${parseFloat(buy.balance_after).toFixed(2)}`;
+
+  send({ proposal_open_contract: 1, contract_id: buy.contract_id, subscribe: 1 });
+  armResultTimer(1);
 }
 
-function handleContractUpdate(contract) {
-  if (!contract.is_sold) return; 
+// If the result never arrives: re-ask once, then unlock
+function armResultTimer(stage) {
+  clearTimeout(resultTimer);
+  resultTimer = setTimeout(() => {
+    if (!tradeLock || !currentContractId) return;
+    if (stage === 1) {
+      logInfo("Waiting for result… re-checking contract.");
+      send({ proposal_open_contract: 1, contract_id: currentContractId, subscribe: 1 });
+      armResultTimer(2);
+    } else {
+      logInfo("Result timed out. Unlocking.");
+      tradeLock = false;
+      currentContractId = null;
+      if (isExecuting) botState = "TRADING";
+    }
+  }, 20000);
+}
 
-  clearTimeout(safetyTimeout);
-  const profit = parseFloat(contract.profit);
-  const stake = stakeInput.value;
-  const exitPrice = contract.exit_tick || contract.sell_price || currentEntryPrice;
-  const exitDigit = getLastDigit(exitPrice);
+function handleContractUpdate(c, subscription) {
+  if (!c.is_sold) return;
+  if (c.contract_id !== currentContractId) return;
+  if (settledIds.has(c.contract_id)) return;
+  settledIds.add(c.contract_id);
+
+  clearTimeout(resultTimer);
+  if (subscription?.id) send({ forget: subscription.id });
+
+  const profit = parseFloat(c.profit);
+  const entryPrice = c.entry_spot_display_value || c.entry_tick_display_value || c.entry_spot || currentEntry.price;
+  const exitPrice = c.exit_tick_display_value || c.exit_tick || c.sell_spot_display_value || currentEntry.price;
+  const entryDigit = lastDigit(entryPrice);
+  const exitDigit = lastDigit(exitPrice);
 
   if (profit > 0) {
     wins++;
     winsEl.textContent = wins;
-    logTrade("win", currentEntryPrice, currentEntryDigit, exitPrice, exitDigit, stake, profit);
-    
+    logTrade("win", entryPrice, entryDigit, exitPrice, exitDigit, currentStake, profit);
     currentMartingaleStep = 1;
-    stakeInput.value = baseStake;
-    updateMartingaleUI();
-    botState = "TRADING";
+    if (isExecuting) botState = "TRADING";
   } else {
     losses++;
     lossesEl.textContent = losses;
-    logTrade("loss", currentEntryPrice, currentEntryDigit, exitPrice, exitDigit, stake, profit);
-    
-    if (currentMartingaleStep >= parseInt(martingaleMaxSteps.value, 10)) {
-      logInfo(`Max Steps reached. Stopping.`);
-      stopBot();
+    logTrade("loss", entryPrice, entryDigit, exitPrice, exitDigit, currentStake, profit);
+
+    if (currentMartingaleStep >= getMaxSteps()) {
+      currentMartingaleStep = 1;
+      tradeLock = false;
+      currentContractId = null;
+      updateMartingaleUI();
+      if (isExecuting) stopBot("Max martingale steps reached.");
       return;
     }
-
     currentMartingaleStep++;
-    const newStake = (baseStake * Math.pow(parseFloat(martingaleMultiplier.value), currentMartingaleStep - 1)).toFixed(2);
-    stakeInput.value = newStake;
-    updateMartingaleUI();
-
-    botState = "HOOK"; 
-    hookTicksCount = 0;
-    logInfo(`Hook active. Waiting for 2 wins...`);
+    if (isExecuting) {
+      botState = "HOOK";
+      hookTicksCount = 0;
+      logInfo("Hook active. Waiting for 2 winning digits in a row…");
+    }
   }
-  
-  isTradeActive = false;
-  queuedTick = null; // Clear any stale ticks
-  ws.send(JSON.stringify({ forget: contract.id, req_id: reqId++ }));
-  
-  // Pre-fetch the next proposal
-  fetchProposalInBackground();
+
+  tradeLock = false;
+  currentContractId = null;
+  updateMartingaleUI();
 }
 
 function updateMartingaleUI() {
-  mbStatus.textContent = `Step ${currentMartingaleStep} / ${martingaleMultiplier.value}x`;
+  const step = currentMartingaleStep;
+  mbStatus.textContent = `Step ${step} / ${getMaxSteps()} · $${stakeForStep(step).toFixed(2)}`;
 }
 
 // ---- CONTROLS ----
 startBtn.addEventListener("click", () => {
-  if (!ws || ws.readyState !== WebSocket.OPEN) { logInfo("Not connected."); return; }
+  if (!wsOpen()) { logInfo("Not connected."); return; }
   if (activeAccount.type === "real" && !confirm("⚠️ WARNING: Real money trading. Are you sure?")) return;
-  
-  sessionId++; 
-  baseStake = parseFloat(stakeInput.value);
+
+  const base = getBase();
+  if (!(base >= 0.35)) { logInfo("Stake must be at least 0.35."); return; }
+  if (NEEDS_BARRIER.includes(contractType.value)) {
+    const b = getBarrier();
+    if (!(b >= 0 && b <= 9)) { logInfo("Barrier must be a digit 0–9."); return; }
+    if (contractType.value === "DIGITOVER" && b === 9) { logInfo("Over 9 can never win. Pick a lower barrier."); return; }
+    if (contractType.value === "DIGITUNDER" && b === 0) { logInfo("Under 0 can never win. Pick a higher barrier."); return; }
+  }
+
+  currentMartingaleStep = 1;
+  buyErrors = 0;
+  hookTicksCount = 0;
+  tradeLock = false;
+  currentContractId = null;
   isExecuting = true;
   botState = "TRADING";
-  isTradeActive = false;
-  isProposalPending = false;
-  activeProposal = null;
-  queuedTick = null;
+  marketSelect.disabled = true;
+  contractType.disabled = true;
   startBtn.disabled = true;
   stopBtn.disabled = false;
-  logInfo("Bot execution started.");
-  
-  fetchProposalInBackground();
+  updateMartingaleUI();
+  logInfo(`Bot started: ${contractType.value} on ${marketSelect.value}, base stake $${base.toFixed(2)}.`);
 });
 
-stopBtn.addEventListener("click", stopBot);
+stopBtn.addEventListener("click", () => stopBot("Bot stopped."));
 
-function stopBot() {
-  sessionId++;
+function stopBot(reason) {
   isExecuting = false;
   botState = "STOPPED";
-  isTradeActive = false;
-  isProposalPending = false;
-  activeProposal = null;
-  queuedTick = null;
-  clearTimeout(safetyTimeout);
-  startBtn.disabled = false;
+  hookTicksCount = 0;
+  clearTimeout(buyTimer);
+  marketSelect.disabled = false;
+  contractType.disabled = false;
+  startBtn.disabled = !wsOpen();
   stopBtn.disabled = true;
-  logInfo("Bot execution stopped.");
+  logInfo(reason || "Bot stopped.");
+  // If a contract is still open, its result will still be logged when it settles.
 }
 
 logoutBtn.addEventListener("click", () => {
-  sessionId++;
-  sessionStorage.removeItem('deriv_access_token');
+  stopBot("Logged out.");
+  closeSocket();
+  sessionStorage.removeItem("deriv_access_token");
   accessToken = null;
   accounts = [];
   activeAccount = null;
-  isExecuting = false;
-  if (ws) { ws.close(); ws = null; }
+  tradeLock = false;
+  currentContractId = null;
   loginCard.style.display = "block";
   botDashboard.classList.remove("show");
   accountSwitcher.style.display = "none";
   authText.textContent = "Not logged in";
   authDot.classList.remove("connected");
+  loginBtn.disabled = false;
+  loginBtn.textContent = "Login with Deriv";
 });
 
 loginBtn.addEventListener("click", startLogin);
 martingaleMultiplier.addEventListener("change", updateMartingaleUI);
 martingaleMaxSteps.addEventListener("change", updateMartingaleUI);
+stakeInput.addEventListener("input", updateMartingaleUI);
 
 // ---- BOOT ----
+function showDashboard() {
+  loginCard.style.display = "none";
+  botDashboard.classList.add("show");
+  authDot.classList.add("connected");
+  authText.textContent = "Connected";
+}
+
 async function init() {
-  const success = await handleCallback();
-  if (success) {
-    const accountOk = await fetchAccounts();
-    if (accountOk) {
-      loginCard.style.display = "none";
-      botDashboard.classList.add("show");
-      authDot.classList.add("connected");
-      authText.textContent = "Connected";
-    }
-  } else {
-    const storedToken = sessionStorage.getItem('deriv_access_token');
-    if (storedToken) {
-      accessToken = storedToken;
-      const accountOk = await fetchAccounts();
-      if (accountOk) {
-        loginCard.style.display = "none";
-        botDashboard.classList.add("show");
-        authDot.classList.add("connected");
-        authText.textContent = "Connected";
-      }
-    }
+  stopBtn.disabled = true;
+  let ok = await handleCallback();
+  if (!ok) {
+    const stored = sessionStorage.getItem("deriv_access_token");
+    if (stored) accessToken = stored;
+    else return;
+  }
+  if (await fetchAccounts()) {
+    showDashboard();
+    updateMartingaleUI();
   }
 }
 
