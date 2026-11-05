@@ -1,5 +1,5 @@
 // ============================================
-//  SPEED BOT — V5.0 (Strict Queue & Clean Logs)
+//  SPEED BOT — V5.1 (Anti-Freeze & Safe Unlock)
 // ============================================
 
 const CLIENT_ID = "34RaG6zRPpQYEeugvLnPq";
@@ -22,8 +22,9 @@ let currentMartingaleStep = 1;
 let wins = 0, losses = 0, totalTrades = 0;
 let baseStake = 0.35;
 
-// 🚨 THE LOCK: Prevents multi-firing
+// THE LOCK
 let isTradeActive = false; 
+let safetyTimeout = null; // 🚨 Fail-safe timer
 
 // Proposal Caching
 let cachedProposalId = null;
@@ -70,15 +71,12 @@ function logTrade(type, entryPrice, entryDigit, exitPrice, exitDigit, stake, pl)
   
   const plText = pl >= 0 ? `+$${pl.toFixed(2)}` : `-$${Math.abs(pl).toFixed(2)}`;
   const plClass = pl >= 0 ? "pl-positive" : "pl-negative";
-  
-  // Color the digits
-  const entryDigitClass = type === "win" ? "digit-green" : "digit-red";
-  const exitDigitClass = type === "win" ? "digit-green" : "digit-red";
+  const digitClass = type === "win" ? "digit-green" : "digit-red";
 
   entryEl.innerHTML = `
     <span class="log-time">${time}</span>
-    <span>Entry: <span class="${entryDigitClass}">${entryDigit}</span> @ ${parseFloat(entryPrice).toFixed(2)}</span>
-    <span>Exit: <span class="${exitDigitClass}">${exitDigit}</span> @ ${parseFloat(exitPrice).toFixed(2)}</span>
+    <span>Entry: <span class="${digitClass}">${entryDigit}</span> @ ${parseFloat(entryPrice).toFixed(2)}</span>
+    <span>Exit: <span class="${digitClass}">${exitDigit}</span> @ ${parseFloat(exitPrice).toFixed(2)}</span>
     <span class="${plClass}">${plText} ($${stake})</span>
   `;
   logBox.appendChild(entryEl);
@@ -216,7 +214,6 @@ function subscribeTicks() {
 
 // --- STRICT QUEUE LOGIC ---
 function handleTick(tick) {
-  // 🚨 THE LOCK: If a trade is active, absolutely do nothing.
   if (isTradeActive || botState === "WAITING_RESULT" || botState === "IDLE" || botState === "STOPPED") return;
 
   if (botState === "HOOK") {
@@ -259,14 +256,24 @@ function checkWinCondition(digit) {
   return false;
 }
 
-// 🚨 FAST BUY & LOCK
+// 🚨 FAST BUY WITH FAIL-SAFE
 function fireCachedTrade(price, digit) {
-  isTradeActive = true; // LOCK THE BOT
+  isTradeActive = true; 
   botState = "WAITING_RESULT";
   
   currentEntryPrice = price;
   currentEntryDigit = digit;
   
+  // Fail-safe: If Deriv API glitches, unlock after 3 seconds
+  clearTimeout(safetyTimeout);
+  safetyTimeout = setTimeout(() => {
+    if (isTradeActive) {
+      logInfo("API Timeout. Unlocking bot safely.");
+      isTradeActive = false;
+      botState = "TRADING";
+    }
+  }, 3000);
+
   const stake = parseFloat(stakeInput.value);
   const type = contractType.value;
   const barrier = parseInt(barrierInput.value, 10);
@@ -311,7 +318,6 @@ function handleProposal(proposal) {
     cachedProposalId = proposal.id;
     cachedProposalAskPrice = proposal.ask_price;
   } else {
-    // Fallback
     ws.send(JSON.stringify({
       buy: proposal.id,
       price: proposal.ask_price,
@@ -334,12 +340,15 @@ function handleBuy(buy) {
 }
 
 function handleContractUpdate(contract) {
-  // 🚨 STRICT CHECK: Wait for the contract to be sold AND have an exit tick
-  if (!contract.is_sold || !contract.exit_tick) return; 
+  // 🚨 FIX: Only check is_sold. Extract price safely.
+  if (!contract.is_sold) return; 
+
+  // Clear the fail-safe timer
+  clearTimeout(safetyTimeout);
 
   const profit = parseFloat(contract.profit);
   const stake = stakeInput.value;
-  const exitPrice = contract.exit_tick;
+  const exitPrice = contract.exit_tick || contract.sell_price || currentEntryPrice;
   const exitDigit = getLastDigit(exitPrice);
 
   const entryStr = currentEntryDigit;
@@ -380,7 +389,6 @@ function handleContractUpdate(contract) {
     fetchProposalInBackground();
   }
   
-  // 🚨 UNLOCK: Ready for next trade
   isTradeActive = false;
   ws.send(JSON.stringify({ forget: contract.id, req_id: reqId++ }));
 }
@@ -412,6 +420,7 @@ function stopBot() {
   isExecuting = false;
   botState = "STOPPED";
   isTradeActive = false;
+  clearTimeout(safetyTimeout);
   startBtn.disabled = false;
   stopBtn.disabled = true;
   cachedProposalId = null;
