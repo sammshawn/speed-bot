@@ -1,5 +1,6 @@
 // ============================================
-//  SPEED BOT — V10.0 (Stable Connection + Correct Prices)
+//  SPEED BOT — V11.0 (Final Fix)
+//  Fixes: InvalidContractProposal, Fake Digits, Martingale Reset
 // ============================================
 
 const CLIENT_ID = "34RaG6zRPpQYEeugvLnPq";
@@ -16,7 +17,7 @@ let ws = null;
 let reqId = 1;
 let reconnectAttempts = 0;
 let reconnectTimer = null;
-let pingInterval = null; // 🚨 Heartbeat timer
+let pingInterval = null;
 
 let isExecuting = false;       
 let botState = "IDLE";         
@@ -26,6 +27,7 @@ let resultTimer = null;
 
 let hookTicksCount = 0;
 let currentMartingaleStep = 1;
+let baseStake = 0.35; // 🚨 Store base stake separately
 let wins = 0, losses = 0, totalTrades = 0;
 let totalPL = 0;
 let currentStake = 0.35;
@@ -79,7 +81,7 @@ const getMaxSteps = () => parseInt(martingaleMaxSteps.value, 10) || 1;
 const getBarrier = () => parseInt(barrierInput.value, 10);
 
 function stakeForStep(step) {
-  return round2(getBase() * Math.pow(getMult(), step - 1));
+  return round2(baseStake * Math.pow(getMult(), step - 1));
 }
 
 function lastDigit(str) {
@@ -103,10 +105,8 @@ function checkWinCondition(digit) {
   }
 }
 
-// ---- 🚨 PRICE EXTRACTION FIX ----
 function extractPrice(contract, isEntry) {
   if (!contract) return null;
-  // Try every possible field Deriv uses
   const fields = isEntry 
     ? ["entry_spot_display_value", "entry_tick_display_value", "entry_spot", "entry_tick"]
     : ["exit_tick_display_value", "exit_tick", "sell_spot_display_value", "sell_spot", "sell_price"];
@@ -269,7 +269,7 @@ pillReal.addEventListener("click", () => {
   if (a) selectAccount(a);
 });
 
-// ---- WEBSOCKET (With Heartbeat) ----
+// ---- WEBSOCKET ----
 function closeSocket() {
   clearTimeout(reconnectTimer);
   clearInterval(pingInterval);
@@ -296,12 +296,15 @@ async function connectWS() {
     socket.onopen = () => {
       if (socket !== ws) return;
       reconnectAttempts = 0;
+      
+      // 🚨 CLEAR STALE PROPOSAL CACHE ON RECONNECT
+      cachedProposal = null; 
+      
       send({ balance: 1, subscribe: 1 });
       subscribeTicks();
       startBtn.disabled = isExecuting;
       logInfo("Connected. Ready.");
       
-      // 🚨 HEARTBEAT: Ping every 20 seconds to keep the connection alive
       clearInterval(pingInterval);
       pingInterval = setInterval(() => {
         if (wsOpen()) send({ ping: 1 });
@@ -478,7 +481,6 @@ function handleBuy(buy) {
   send({ proposal_open_contract: 1, contract_id: buy.contract_id, subscribe: 1 });
 }
 
-// 🚨 CONTRACT UPDATE WITH SAFE PRICE EXTRACTION
 function handleContractUpdate(c) {
   if (!c.is_sold) return;
   if (c.contract_id !== currentContractId) return;
@@ -488,10 +490,9 @@ function handleContractUpdate(c) {
 
   const profit = parseFloat(c.profit) || 0;
   
-  // Extract prices safely
-  const entryPrice = extractPrice(c, true) || currentEntry.price || "0.00";
-  const exitPrice = extractPrice(c, false) || currentEntry.price || "0.00";
-  
+  // Use the exact contract prices
+  const entryPrice = extractPrice(c, true) || currentEntry.price;
+  const exitPrice = extractPrice(c, false) || currentEntry.price;
   const entryDigit = lastDigit(entryPrice);
   const exitDigit = lastDigit(exitPrice);
 
@@ -502,7 +503,11 @@ function handleContractUpdate(c) {
     wins++;
     winsEl.textContent = wins;
     logTrade("win", entryPrice, entryDigit, exitPrice, exitDigit, currentStake, profit);
+    
+    // 🚨 MARTINGALE RESET: Go back to Step 1 AND restore the base stake
     currentMartingaleStep = 1;
+    stakeInput.value = baseStake;
+    updateMartingaleUI();
     if (isExecuting) botState = "TRADING";
   } else {
     losses++;
@@ -545,6 +550,7 @@ startBtn.addEventListener("click", () => {
   const base = getBase();
   if (!(base >= 0.35)) { logInfo("Stake must be at least 0.35."); return; }
 
+  baseStake = base; // 🚨 Save the base stake
   currentMartingaleStep = 1;
   hookTicksCount = 0;
   tradeLock = false;
