@@ -1,5 +1,5 @@
 // ============================================
-//  SPEED BOT — V4.0 (Trading Terminal)
+//  SPEED BOT — V5.0 (Strict Queue & Clean Logs)
 // ============================================
 
 const CLIENT_ID = "34RaG6zRPpQYEeugvLnPq";
@@ -19,8 +19,11 @@ let isExecuting = false;
 let botState = "IDLE"; 
 let hookTicksCount = 0;
 let currentMartingaleStep = 1;
-let wins = 0, losses = 0, totalTrades = 0, totalPL = 0;
+let wins = 0, losses = 0, totalTrades = 0;
 let baseStake = 0.35;
+
+// 🚨 THE LOCK: Prevents multi-firing
+let isTradeActive = false; 
 
 // Proposal Caching
 let cachedProposalId = null;
@@ -47,7 +50,6 @@ const balanceEl = document.getElementById("balance");
 const tradeCountEl = document.getElementById("tradeCount");
 const winsEl = document.getElementById("wins");
 const lossesEl = document.getElementById("losses");
-const totalPLEl = document.getElementById("totalPL");
 const logBox = document.getElementById("logBox");
 const clearLogBtn = document.getElementById("clearLogBtn");
 const startBtn = document.getElementById("startBtn");
@@ -61,19 +63,23 @@ const martingaleMultiplier = document.getElementById("martingaleMultiplier");
 const martingaleMaxSteps = document.getElementById("martingaleMaxSteps");
 
 // ---- LOGGING ----
-function logTrade(type, entry, exit, stake, pl) {
+function logTrade(type, entryPrice, entryDigit, exitPrice, exitDigit, stake, pl) {
   const entryEl = document.createElement("div");
   entryEl.className = `log-entry ${type}`;
   const time = new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute:'2-digit', second:'2-digit' });
   
   const plText = pl >= 0 ? `+$${pl.toFixed(2)}` : `-$${Math.abs(pl).toFixed(2)}`;
+  const plClass = pl >= 0 ? "pl-positive" : "pl-negative";
   
+  // Color the digits
+  const entryDigitClass = type === "win" ? "digit-green" : "digit-red";
+  const exitDigitClass = type === "win" ? "digit-green" : "digit-red";
+
   entryEl.innerHTML = `
     <span class="log-time">${time}</span>
-    <span>${entry}</span>
-    <span>${exit}</span>
-    <span>$${stake}</span>
-    <span>${plText}</span>
+    <span>Entry: <span class="${entryDigitClass}">${entryDigit}</span> @ ${parseFloat(entryPrice).toFixed(2)}</span>
+    <span>Exit: <span class="${exitDigitClass}">${exitDigit}</span> @ ${parseFloat(exitPrice).toFixed(2)}</span>
+    <span class="${plClass}">${plText} ($${stake})</span>
   `;
   logBox.appendChild(entryEl);
   logBox.scrollTop = logBox.scrollHeight;
@@ -82,7 +88,7 @@ function logTrade(type, entry, exit, stake, pl) {
 function logInfo(msg) {
   const entryEl = document.createElement("div");
   entryEl.className = `log-entry info`;
-  entryEl.innerHTML = `<span class="log-time">${new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute:'2-digit', second:'2-digit' })}</span><span style="grid-column: span 4;">${msg}</span>`;
+  entryEl.innerHTML = `<span class="log-time">${new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute:'2-digit', second:'2-digit' })}</span><span style="grid-column: span 3;">${msg}</span>`;
   logBox.appendChild(entryEl);
   logBox.scrollTop = logBox.scrollHeight;
 }
@@ -191,7 +197,6 @@ async function connectWS() {
       
       if (msg.msg_type === "balance") balanceEl.textContent = `$${parseFloat(msg.balance.balance).toFixed(2)}`;
       
-      // 🚨 Only process if executing
       if (!isExecuting) return;
 
       if (msg.msg_type === "tick") handleTick(msg.tick);
@@ -209,9 +214,10 @@ function subscribeTicks() {
   ws.send(JSON.stringify({ ticks: marketSelect.value, subscribe: 1, req_id: reqId++ }));
 }
 
-// --- FAST EXECUTION LOGIC ---
+// --- STRICT QUEUE LOGIC ---
 function handleTick(tick) {
-  if (botState === "WAITING_RESULT" || botState === "IDLE" || botState === "STOPPED") return;
+  // 🚨 THE LOCK: If a trade is active, absolutely do nothing.
+  if (isTradeActive || botState === "WAITING_RESULT" || botState === "IDLE" || botState === "STOPPED") return;
 
   if (botState === "HOOK") {
     const digit = getLastDigit(tick.quote);
@@ -221,7 +227,6 @@ function handleTick(tick) {
       hookTicksCount++;
       if (hookTicksCount >= 2) {
         logInfo(`Hook fired. Recovering...`);
-        botState = "WAITING_RESULT";
         fireCachedTrade(tick.quote, digit);
       }
     } else {
@@ -231,7 +236,6 @@ function handleTick(tick) {
   }
 
   if (botState === "TRADING") {
-    botState = "WAITING_RESULT";
     fireCachedTrade(tick.quote, getLastDigit(tick.quote));
   }
 }
@@ -255,8 +259,11 @@ function checkWinCondition(digit) {
   return false;
 }
 
-// 🚨 FAST BUY: Uses cached proposal if available, else requests one
+// 🚨 FAST BUY & LOCK
 function fireCachedTrade(price, digit) {
+  isTradeActive = true; // LOCK THE BOT
+  botState = "WAITING_RESULT";
+  
   currentEntryPrice = price;
   currentEntryDigit = digit;
   
@@ -265,21 +272,14 @@ function fireCachedTrade(price, digit) {
   const barrier = parseInt(barrierInput.value, 10);
 
   if (cachedProposalId && cachedProposalAskPrice) {
-    // Instant buy from cache
     ws.send(JSON.stringify({
       buy: cachedProposalId,
       price: cachedProposalAskPrice,
       req_id: reqId++
     }));
-    // Clear cache for the next trade
     cachedProposalId = null;
     cachedProposalAskPrice = null;
-    
-    // Pre-fetch the NEXT proposal immediately in the background
-    fetchProposalInBackground();
-    
   } else {
-    // Cache missed, fallback to requesting a fresh proposal
     const req = {
       proposal: 1, amount: stake.toFixed(2), basis: "stake",
       contract_type: type, currency: "USD", duration: 1, duration_unit: "t",
@@ -307,12 +307,11 @@ function fetchProposalInBackground() {
 }
 
 function handleProposal(proposal) {
-  // If we are currently in WAITING_RESULT, this is the background fetch. Cache it.
   if (botState === "WAITING_RESULT") {
     cachedProposalId = proposal.id;
     cachedProposalAskPrice = proposal.ask_price;
   } else {
-    // Fallback: If we needed a proposal to fire the trade right now
+    // Fallback
     ws.send(JSON.stringify({
       buy: proposal.id,
       price: proposal.ask_price,
@@ -335,29 +334,22 @@ function handleBuy(buy) {
 }
 
 function handleContractUpdate(contract) {
-  if (!contract.is_sold) return; 
+  // 🚨 STRICT CHECK: Wait for the contract to be sold AND have an exit tick
+  if (!contract.is_sold || !contract.exit_tick) return; 
 
   const profit = parseFloat(contract.profit);
   const stake = stakeInput.value;
-  const type = contractType.value;
-  const barrier = barrierInput.value;
-  const exitPrice = contract.exit_tick; // Deriv sends exit tick price
-  const exitDigit = exitPrice ? getLastDigit(exitPrice) : "?";
+  const exitPrice = contract.exit_tick;
+  const exitDigit = getLastDigit(exitPrice);
 
-  // Update P/L
-  totalPL += profit;
-  totalPLEl.textContent = totalPL >= 0 ? `+$${totalPL.toFixed(2)}` : `-$${Math.abs(totalPL).toFixed(2)}`;
-  totalPLEl.style.color = totalPL >= 0 ? "var(--green)" : "var(--red)";
-
-  const entryStr = `${currentEntryDigit} @ ${parseFloat(currentEntryPrice).toFixed(2)}`;
-  const exitStr = `${exitDigit} @ ${parseFloat(exitPrice || 0).toFixed(2)}`;
+  const entryStr = currentEntryDigit;
+  const exitStr = exitDigit;
 
   if (profit > 0) {
     wins++;
     winsEl.textContent = wins;
-    logTrade("win", entryStr, exitStr, stake, profit);
+    logTrade("win", currentEntryPrice, entryStr, exitPrice, exitStr, stake, profit);
     
-    // 🚨 MARTINGALE FIX: Reset to the ORIGINAL Base Stake
     currentMartingaleStep = 1;
     stakeInput.value = baseStake;
     updateMartingaleUI();
@@ -366,7 +358,7 @@ function handleContractUpdate(contract) {
   } else {
     losses++;
     lossesEl.textContent = losses;
-    logTrade("loss", entryStr, exitStr, stake, profit);
+    logTrade("loss", currentEntryPrice, entryStr, exitPrice, exitStr, stake, profit);
     
     const maxSteps = parseInt(martingaleMaxSteps.value, 10);
     if (currentMartingaleStep >= maxSteps) {
@@ -385,10 +377,11 @@ function handleContractUpdate(contract) {
     hookTicksCount = 0;
     logInfo(`Hook active. Waiting for 2 wins...`);
     
-    // Fetch the new (higher) proposal for the recovery trade
     fetchProposalInBackground();
   }
   
+  // 🚨 UNLOCK: Ready for next trade
+  isTradeActive = false;
   ws.send(JSON.stringify({ forget: contract.id, req_id: reqId++ }));
 }
 
@@ -402,16 +395,14 @@ startBtn.addEventListener("click", () => {
   if (!ws || ws.readyState !== WebSocket.OPEN) { logInfo("Not connected."); return; }
   if (activeAccount.type === "real" && !confirm("⚠️ WARNING: Real money trading. Are you sure?")) return;
   
-  // Set base stake
   baseStake = parseFloat(stakeInput.value);
-  
   isExecuting = true;
   botState = "TRADING";
+  isTradeActive = false;
   startBtn.disabled = true;
   stopBtn.disabled = false;
   logInfo("Bot execution started.");
   
-  // Pre-fetch the very first proposal
   fetchProposalInBackground();
 });
 
@@ -420,6 +411,7 @@ stopBtn.addEventListener("click", stopBot);
 function stopBot() {
   isExecuting = false;
   botState = "STOPPED";
+  isTradeActive = false;
   startBtn.disabled = false;
   stopBtn.disabled = true;
   cachedProposalId = null;
@@ -433,6 +425,7 @@ logoutBtn.addEventListener("click", () => {
   accounts = [];
   activeAccount = null;
   isExecuting = false;
+  isTradeActive = false;
   if (ws) { ws.close(); ws = null; }
   loginCard.style.display = "block";
   botDashboard.classList.remove("show");
