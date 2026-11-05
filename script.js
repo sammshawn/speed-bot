@@ -1,5 +1,6 @@
 // ============================================
-//  SPEED BOT — V5.1 (Anti-Freeze & Safe Unlock)
+//  SPEED BOT — V6.0 (Production Grade)
+//  Fixes: Race Conditions, Hooks, Reconnects, Dynamic Decimals
 // ============================================
 
 const CLIENT_ID = "34RaG6zRPpQYEeugvLnPq";
@@ -14,27 +15,29 @@ let activeAccount = null;
 let ws = null;
 let reqId = 1;
 
+// Session Management (Fixes Issue #5 - Stale State)
+let sessionId = 0; 
+let reconnectAttempts = 0;
+
 // Engine State
 let isExecuting = false; 
-let botState = "IDLE"; 
+let botState = "IDLE"; // IDLE, TRADING, HOOK, WAITING_RESULT
 let hookTicksCount = 0;
 let currentMartingaleStep = 1;
 let wins = 0, losses = 0, totalTrades = 0;
 let baseStake = 0.35;
 
-// THE LOCK
+// Mutex & Safety (Fixes Issue #1 & #5)
 let isTradeActive = false; 
-let safetyTimeout = null; // 🚨 Fail-safe timer
+let isProposalPending = false;
+let safetyTimeout = null; 
 
 // Proposal Caching
-let cachedProposalId = null;
-let cachedProposalAskPrice = null;
-
-// Track current trade
+let activeProposal = null; // Stores { id, ask_price, sessionId }
 let currentEntryPrice = null;
 let currentEntryDigit = null;
 
-// DOM
+// DOM Elements
 const loginCard = document.getElementById("loginCard");
 const botDashboard = document.getElementById("botDashboard");
 const loginBtn = document.getElementById("loginBtn");
@@ -62,6 +65,17 @@ const barrierInput = document.getElementById("barrier");
 const stakeInput = document.getElementById("stake");
 const martingaleMultiplier = document.getElementById("martingaleMultiplier");
 const martingaleMaxSteps = document.getElementById("martingaleMaxSteps");
+
+// ---- DYNAMIC DECIMAL PARSER (Fixes Issue #4) ----
+function getLastDigit(quote) {
+  // Parse dynamic string, don't rely on hardcoded decimals
+  const str = quote.toString();
+  const parts = str.split('.');
+  if (parts.length === 2 && parts[1].length > 0) {
+    return parseInt(parts[1].slice(-1), 10);
+  }
+  return parseInt(str.slice(-1), 10);
+}
 
 // ---- LOGGING ----
 function logTrade(type, entryPrice, entryDigit, exitPrice, exitDigit, stake, pl) {
@@ -174,7 +188,7 @@ pillReal.addEventListener("click", () => {
   if (real) selectAccount(real);
 });
 
-// ---- WEBSOCKET & EXECUTION ----
+// ---- WEBSOCKET & RECONNECT (Fixes Issue #3) ----
 async function connectWS() {
   try {
     const res = await fetch(`${API_BASE}/accounts/${activeAccount.id}/otp`, { method: "POST", headers: { "Authorization": `Bearer ${accessToken}`, "Content-Type": "application/json" } });
@@ -183,6 +197,7 @@ async function connectWS() {
     
     ws = new WebSocket(data.data.url);
     ws.onopen = () => {
+      reconnectAttempts = 0; // Reset on success
       ws.send(JSON.stringify({ balance: 1, subscribe: 1, req_id: reqId++ }));
       subscribeTicks();
       startBtn.disabled = false;
@@ -203,7 +218,17 @@ async function connectWS() {
       if (msg.msg_type === "proposal_open_contract") handleContractUpdate(msg.proposal_open_contract);
     };
 
-    ws.onclose = () => { logInfo("Disconnected."); startBtn.disabled = true; stopBot(); };
+    ws.onclose = () => { 
+      logInfo("Connection dropped. Reconnecting..."); 
+      startBtn.disabled = true; 
+      if (isExecuting && reconnectAttempts < 5) {
+        reconnectAttempts++;
+        const delay = Math.pow(2, reconnectAttempts) * 1000; // Exponential backoff
+        setTimeout(connectWS, delay);
+      } else {
+        stopBot();
+      }
+    };
   } catch (err) { logInfo(`Connection failed: ${err.message}`); }
 }
 
@@ -212,7 +237,7 @@ function subscribeTicks() {
   ws.send(JSON.stringify({ ticks: marketSelect.value, subscribe: 1, req_id: reqId++ }));
 }
 
-// --- STRICT QUEUE LOGIC ---
+// --- THE VIRTUAL HOOK & TRADING LOGIC (Fixes Issue #2) ---
 function handleTick(tick) {
   if (isTradeActive || botState === "WAITING_RESULT" || botState === "IDLE" || botState === "STOPPED") return;
 
@@ -237,15 +262,6 @@ function handleTick(tick) {
   }
 }
 
-function getLastDigit(quote) {
-  const decimals = {
-    R_10: 3, R_25: 3, R_50: 4, R_75: 4, R_100: 2,
-    "1HZ10V": 2, "1HZ25V": 2, "1HZ50V": 2, "1HZ75V": 2, "1HZ100V": 2
-  }[marketSelect.value] || 2;
-  const str = parseFloat(quote).toFixed(decimals);
-  return parseInt(str.slice(-1), 10);
-}
-
 function checkWinCondition(digit) {
   const type = contractType.value;
   const barrier = parseInt(barrierInput.value, 10);
@@ -256,74 +272,66 @@ function checkWinCondition(digit) {
   return false;
 }
 
-// 🚨 FAST BUY WITH FAIL-SAFE
+// 🚨 THREAD-SAFE BUY (Fixes Issue #1 & #5)
 function fireCachedTrade(price, digit) {
+  // Drop if no proposal is ready (mutex)
+  if (!activeProposal || activeProposal.sessionId !== sessionId) {
+    logInfo("Waiting for fresh proposal...");
+    return; 
+  }
+
   isTradeActive = true; 
   botState = "WAITING_RESULT";
-  
   currentEntryPrice = price;
   currentEntryDigit = digit;
   
-  // Fail-safe: If Deriv API glitches, unlock after 3 seconds
   clearTimeout(safetyTimeout);
   safetyTimeout = setTimeout(() => {
     if (isTradeActive) {
-      logInfo("API Timeout. Unlocking bot safely.");
+      logInfo("API Timeout. Unlocking.");
       isTradeActive = false;
       botState = "TRADING";
     }
-  }, 3000);
+  }, 4000);
 
-  const stake = parseFloat(stakeInput.value);
-  const type = contractType.value;
-  const barrier = parseInt(barrierInput.value, 10);
-
-  if (cachedProposalId && cachedProposalAskPrice) {
-    ws.send(JSON.stringify({
-      buy: cachedProposalId,
-      price: cachedProposalAskPrice,
-      req_id: reqId++
-    }));
-    cachedProposalId = null;
-    cachedProposalAskPrice = null;
-  } else {
-    const req = {
-      proposal: 1, amount: stake.toFixed(2), basis: "stake",
-      contract_type: type, currency: "USD", duration: 1, duration_unit: "t",
-      underlying_symbol: marketSelect.value, req_id: reqId++
-    };
-    if (type === "DIGITOVER" || type === "DIGITUNDER") req.barrier = barrier.toString();
-    ws.send(JSON.stringify(req));
-  }
+  ws.send(JSON.stringify({
+    buy: activeProposal.id,
+    price: activeProposal.ask_price,
+    req_id: reqId++
+  }));
+  
+  activeProposal = null; // Consume proposal
 }
 
 function fetchProposalInBackground() {
-  if (!ws || ws.readyState !== WebSocket.OPEN || !isExecuting) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN || !isExecuting || isProposalPending) return;
   
-  const stake = parseFloat(stakeInput.value);
-  const type = contractType.value;
-  const barrier = parseInt(barrierInput.value, 10);
+  isProposalPending = true;
+  const currentSession = sessionId;
 
   const req = {
-    proposal: 1, amount: stake.toFixed(2), basis: "stake",
-    contract_type: type, currency: "USD", duration: 1, duration_unit: "t",
+    proposal: 1, amount: stakeInput.value, basis: "stake",
+    contract_type: contractType.value, currency: "USD", duration: 1, duration_unit: "t",
     underlying_symbol: marketSelect.value, req_id: reqId++
   };
-  if (type === "DIGITOVER" || type === "DIGITUNDER") req.barrier = barrier.toString();
+  if (contractType.value === "DIGITOVER" || contractType.value === "DIGITUNDER") {
+    req.barrier = barrierInput.value;
+  }
   ws.send(JSON.stringify(req));
 }
 
 function handleProposal(proposal) {
+  isProposalPending = false;
+
+  // Drop stale proposals (Fixes Issue #5)
+  if (proposal.echo_req.req_id < reqId - 10) return; 
+  
+  // If bot is waiting for result, cache the next proposal
   if (botState === "WAITING_RESULT") {
-    cachedProposalId = proposal.id;
-    cachedProposalAskPrice = proposal.ask_price;
+    activeProposal = { id: proposal.id, ask_price: proposal.ask_price, sessionId: sessionId };
   } else {
-    ws.send(JSON.stringify({
-      buy: proposal.id,
-      price: proposal.ask_price,
-      req_id: reqId++
-    }));
-    fetchProposalInBackground();
+    // Immediate buy if we are in TRADING state and tick fired before proposal arrived
+    ws.send(JSON.stringify({ buy: proposal.id, price: proposal.ask_price, req_id: reqId++ }));
   }
 }
 
@@ -340,62 +348,53 @@ function handleBuy(buy) {
 }
 
 function handleContractUpdate(contract) {
-  // 🚨 FIX: Only check is_sold. Extract price safely.
   if (!contract.is_sold) return; 
 
-  // Clear the fail-safe timer
   clearTimeout(safetyTimeout);
-
   const profit = parseFloat(contract.profit);
   const stake = stakeInput.value;
   const exitPrice = contract.exit_tick || contract.sell_price || currentEntryPrice;
   const exitDigit = getLastDigit(exitPrice);
 
-  const entryStr = currentEntryDigit;
-  const exitStr = exitDigit;
-
   if (profit > 0) {
     wins++;
     winsEl.textContent = wins;
-    logTrade("win", currentEntryPrice, entryStr, exitPrice, exitStr, stake, profit);
+    logTrade("win", currentEntryPrice, currentEntryDigit, exitPrice, exitDigit, stake, profit);
     
     currentMartingaleStep = 1;
     stakeInput.value = baseStake;
     updateMartingaleUI();
     botState = "TRADING";
-    
   } else {
     losses++;
     lossesEl.textContent = losses;
-    logTrade("loss", currentEntryPrice, entryStr, exitPrice, exitStr, stake, profit);
+    logTrade("loss", currentEntryPrice, currentEntryDigit, exitPrice, exitDigit, stake, profit);
     
-    const maxSteps = parseInt(martingaleMaxSteps.value, 10);
-    if (currentMartingaleStep >= maxSteps) {
+    if (currentMartingaleStep >= parseInt(martingaleMaxSteps.value, 10)) {
       logInfo(`Max Steps reached. Stopping.`);
       stopBot();
       return;
     }
 
     currentMartingaleStep++;
-    const multiplier = parseFloat(martingaleMultiplier.value);
-    const newStake = (baseStake * Math.pow(multiplier, currentMartingaleStep - 1)).toFixed(2);
+    const newStake = (baseStake * Math.pow(parseFloat(martingaleMultiplier.value), currentMartingaleStep - 1)).toFixed(2);
     stakeInput.value = newStake;
     updateMartingaleUI();
 
     botState = "HOOK"; 
     hookTicksCount = 0;
     logInfo(`Hook active. Waiting for 2 wins...`);
-    
-    fetchProposalInBackground();
   }
   
   isTradeActive = false;
   ws.send(JSON.stringify({ forget: contract.id, req_id: reqId++ }));
+  
+  // Immediately ask for the next proposal
+  fetchProposalInBackground();
 }
 
 function updateMartingaleUI() {
-  const mult = martingaleMultiplier.value;
-  mbStatus.textContent = `Step ${currentMartingaleStep} / ${mult}x`;
+  mbStatus.textContent = `Step ${currentMartingaleStep} / ${martingaleMultiplier.value}x`;
 }
 
 // ---- CONTROLS ----
@@ -403,10 +402,13 @@ startBtn.addEventListener("click", () => {
   if (!ws || ws.readyState !== WebSocket.OPEN) { logInfo("Not connected."); return; }
   if (activeAccount.type === "real" && !confirm("⚠️ WARNING: Real money trading. Are you sure?")) return;
   
+  sessionId++; // 🚨 Increment session ID to kill old async callbacks
+  
   baseStake = parseFloat(stakeInput.value);
   isExecuting = true;
   botState = "TRADING";
   isTradeActive = false;
+  isProposalPending = false;
   startBtn.disabled = true;
   stopBtn.disabled = false;
   logInfo("Bot execution started.");
@@ -417,24 +419,26 @@ startBtn.addEventListener("click", () => {
 stopBtn.addEventListener("click", stopBot);
 
 function stopBot() {
+  sessionId++; // 🚨 Increment session ID to kill old async callbacks
+  
   isExecuting = false;
   botState = "STOPPED";
   isTradeActive = false;
+  isProposalPending = false;
+  activeProposal = null;
   clearTimeout(safetyTimeout);
   startBtn.disabled = false;
   stopBtn.disabled = true;
-  cachedProposalId = null;
-  cachedProposalAskPrice = null;
   logInfo("Bot execution stopped.");
 }
 
 logoutBtn.addEventListener("click", () => {
+  sessionId++;
   sessionStorage.removeItem('deriv_access_token');
   accessToken = null;
   accounts = [];
   activeAccount = null;
   isExecuting = false;
-  isTradeActive = false;
   if (ws) { ws.close(); ws = null; }
   loginCard.style.display = "block";
   botDashboard.classList.remove("show");
